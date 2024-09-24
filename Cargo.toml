@@ -1,0 +1,11 @@
+[package]
+name = "smoldata"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "*" }
+thiserror = "1.0.63"
+
+[dev-dependencies]
+serde = { version = "*", features = ["derive"] }
