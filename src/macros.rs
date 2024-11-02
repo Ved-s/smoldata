@@ -1,10 +1,28 @@
 #[macro_export]
-macro_rules! enum_repr {
+macro_rules! define_tag {
+    (@unpackarm $unpackty:ident exact $($unpack:tt)*) => {
+        $unpackty::$($unpack)*
+    };
+
+    (@unpackarm $unpackty:ident pack ($($_:tt)*) unpack ($($unpack:tt)*)) => {
+        $unpackty::$($unpack)*
+    };
+
+    (@packarm $unpackty:ident exact $($pack:tt)*) => {
+        $unpackty::$($pack)*
+    };
+
+    (@packarm $unpackty:ident pack ($($pack:tt)*) unpack ($($_:tt)*)) => {
+        $unpackty::$($pack)*
+    };
+
     (
         #[repr($reprty:ty)]
+        #[unpack($unpackty:ident)]
         $(#[$meta:meta])*
         $vis:vis enum $name:ident {
             $(
+                #[unpack($($unpacktt:tt)*)]
                 $(#[$membermeta:meta])*
                 $membername:ident = $membervalue:literal
             ),*
@@ -19,6 +37,41 @@ macro_rules! enum_repr {
                 $(#[$membermeta])*
                 $membername = $membervalue,
             )*
+        }
+
+        impl $name {
+
+            pub const ALL: &[Self] = &[$(Self::$membername),*];
+
+            pub const fn unpack(self) -> $unpackty {
+                match self {
+                    $(
+                        Self::$membername => define_tag!(@unpackarm $unpackty $($unpacktt)*),
+                    )*
+                }
+            }
+        }
+
+        impl $unpackty {
+            pub const fn pack(self) -> $name {
+                match self {
+                    $(
+                        define_tag!(@packarm $unpackty $($unpacktt)*) => $name::$membername,
+                    )*
+                }
+            }
+        }
+
+        impl From<$name> for $unpackty {
+            fn from(value: $name) -> $unpackty {
+                value.unpack()
+            }
+        }
+
+        impl From<$unpackty> for $name {
+            fn from(value: $unpackty) -> $name {
+               value.pack()
+            }
         }
 
         impl From<$name> for $reprty {

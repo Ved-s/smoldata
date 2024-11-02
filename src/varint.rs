@@ -278,6 +278,36 @@ pub fn read_unsigned_varint_bits_le<R: io::Read>(
     Ok(wrote)
 }
 
+pub fn copy_varint<S: io::Read, D: io::Write>(src: &mut S, dst: &mut D) -> Result<(), io::Error> {
+
+    let mut buf = [0u8; 16];
+    let mut buf_len = 0;
+
+    loop {
+        let mut byte = 0u8;
+        src.read_exact(std::slice::from_mut(&mut byte))?;
+        
+        if buf_len >= buf.len() {
+            dst.write_all(&buf[..buf_len])?;
+            buf_len = 0;
+        }
+
+        buf[buf_len] = byte;
+        buf_len += 1;
+
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+
+    if buf_len > 0 {
+        dst.write_all(&buf[..buf_len])?;
+    }
+
+    Ok(())
+}
+
+
 macro_rules! impl_varint_primitives {
     ($($signed:ident:$unsigned:ident),*) => {
 

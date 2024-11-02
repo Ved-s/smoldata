@@ -1,6 +1,9 @@
-use std::{collections::BTreeMap, fmt, io, ops::Deref, slice};
+use std::{collections::BTreeMap, fmt, io, ops::Deref, slice, sync::Arc};
 
-use crate::{varint, TypeTag, FORMAT_VERSION, MAGIC_HEADER};
+use crate::{
+    tag::{FlatTypeTag, FloatWidth, IntWidth, OptionTag, StrNewIndex, StructType, TypeTag},
+    varint, FORMAT_VERSION, MAGIC_HEADER,
+};
 
 // TODO: care about what deserializer wants, not just deserializing any
 
@@ -16,7 +19,7 @@ pub enum DeserializeError {
     InvalidTag(u8),
 
     #[error("Expected {0}, read {1:?}")]
-    Expected(&'static str, TypeTag),
+    Expected(&'static str, FlatTypeTag),
 
     #[error("VarInt reading error")]
     ReadVarint(
@@ -44,7 +47,7 @@ pub enum DeserializeError {
     StringsOnly,
 
     #[error("Tried to deserialize wrong enum type {tried:?} (got {got:?})")]
-    WrongEnumVariantType { tried: EnumType, got: EnumType },
+    WrongEnumVariantType { tried: StructType, got: StructType },
 
     #[error("Attempted to deserialize map key but got value")]
     TriedKeyGotValue,
@@ -77,9 +80,57 @@ pub enum DeserializerInitError {
     UnsupportedVersion(u8),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReadTagError {
+    #[error(transparent)]
+    IOError(#[from] io::Error),
+
+    #[error("Read invalid tag {0}")]
+    InvalidTag(u8),
+}
+
+impl From<ReadTagError> for DeserializeError {
+    fn from(val: ReadTagError) -> Self {
+        match val {
+            ReadTagError::IOError(error) => Self::IOError(error),
+            ReadTagError::InvalidTag(i) => Self::InvalidTag(i),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReadStrError {
+    #[error(transparent)]
+    IOError(#[from] io::Error),
+
+    #[error("Read invalid string id {0}")]
+    InvalidStringId(u32),
+
+    #[error("Read invalid UTF-8 data")]
+    InvalidUTF8String,
+
+    #[error("VarInt reading error")]
+    ReadVarint(
+        #[from]
+        #[source]
+        varint::VarIntReadError,
+    ),
+}
+
+impl From<ReadStrError> for DeserializeError {
+    fn from(val: ReadStrError) -> Self {
+        match val {
+            ReadStrError::IOError(error) => Self::IOError(error),
+            ReadStrError::InvalidStringId(i) => Self::InvalidStringId(i),
+            ReadStrError::InvalidUTF8String => Self::InvalidUTF8String,
+            ReadStrError::ReadVarint(v) => Self::ReadVarint(v)
+        }
+    }
+}
+
 pub struct Deserializer<R: io::Read> {
-    reader: R,
-    string_map: BTreeMap<u32, Box<str>>,
+    pub(crate) reader: R,
+    pub(crate) string_map: BTreeMap<u32, Arc<str>>,
     tag_peek: Option<TypeTag>,
     level: usize,
 
@@ -88,7 +139,6 @@ pub struct Deserializer<R: io::Read> {
 }
 
 impl<R: io::Read> Deserializer<R> {
-    
     /// Construct a new Deserializer.<br>
     /// Reader preferred to be buffered, deserialization does many small reads
     pub fn new(mut reader: R) -> Result<Self, DeserializerInitError> {
@@ -103,68 +153,83 @@ impl<R: io::Read> Deserializer<R> {
             return Err(DeserializerInitError::UnsupportedVersion(ver));
         }
 
-        Ok(Self {
+        Ok(Self::new_bare(reader, ver))
+    }
+
+    pub(crate) fn new_bare(reader: R, data_version: u8) -> Self {
+        Self {
             reader,
             string_map: Default::default(),
             tag_peek: None,
             level: 0,
-            data_version: ver,
-        })
+            data_version,
+        }
     }
 
-    fn read_tag(&mut self) -> Result<TypeTag, DeserializeError> {
+    pub(crate) fn read_tag(&mut self) -> Result<TypeTag, ReadTagError> {
         if let Some(tag) = self.tag_peek.take() {
             return Ok(tag);
         }
 
         let mut byte = 0u8;
         self.reader.read_exact(slice::from_mut(&mut byte))?;
-        TypeTag::try_from(byte).map_err(DeserializeError::InvalidTag)
+        FlatTypeTag::try_from(byte)
+            .map(Into::into)
+            .map_err(ReadTagError::InvalidTag)
     }
 
-    fn peek_tag(&mut self) -> Result<TypeTag, DeserializeError> {
+    pub(crate) fn peek_tag(&mut self) -> Result<TypeTag, ReadTagError> {
         if let Some(tag) = self.tag_peek {
             return Ok(tag);
         }
 
         let mut byte = 0u8;
         self.reader.read_exact(slice::from_mut(&mut byte))?;
-        let tag = TypeTag::try_from(byte).map_err(DeserializeError::InvalidTag)?;
+        let tag = FlatTypeTag::try_from(byte)
+            .map(Into::into)
+            .map_err(ReadTagError::InvalidTag)?;
         self.tag_peek = Some(tag);
         Ok(tag)
     }
 
-    fn peek_tag_consume(&mut self) -> Option<TypeTag> {
+    pub(crate) fn peek_tag_consume(&mut self) -> Option<TypeTag> {
         self.tag_peek.take()
     }
 
-    fn read_str_by_index(&mut self) -> Result<&str, DeserializeError> {
+    pub(crate) fn read_str_by_index(&mut self) -> Result<Arc<str>, ReadStrError> {
         let index = varint::read_unsigned_varint(&mut self.reader)?;
         let str = self
             .string_map
             .get(&index)
-            .ok_or(DeserializeError::InvalidStringId(index))?;
-        Ok(str.deref())
+            .ok_or(ReadStrError::InvalidStringId(index))?;
+        Ok(str.clone())
     }
 
-    fn read_str_new(&mut self) -> Result<&str, DeserializeError> {
+    pub(crate) fn read_str_new(&mut self) -> Result<Arc<str>, ReadStrError> {
         let index = varint::read_unsigned_varint(&mut self.reader)?;
         let len = varint::read_unsigned_varint(&mut self.reader)?;
         let mut data = vec![0u8; len];
         self.reader.read_exact(&mut data)?;
-        let string = String::from_utf8(data).map_err(|_| DeserializeError::InvalidUTF8String)?;
+        let string = String::from_utf8(data).map_err(|_| ReadStrError::InvalidUTF8String)?;
 
         let boxed = self.string_map.entry(index).or_default();
         *boxed = string.into();
 
-        Ok(boxed)
+        Ok(boxed.clone())
+    }
+
+    pub(crate) fn read_str(&mut self, ty: StrNewIndex) -> Result<Arc<str>, ReadStrError> {
+        match ty {
+            StrNewIndex::New => self.read_str_new(),
+            StrNewIndex::Index => self.read_str_by_index(),
+        }
     }
 
     fn visit_enum<'de, V: serde::de::Visitor<'de>>(
         &mut self,
         visitor: V,
-        ty: EnumType,
-        str: StringType,
+        ty: StructType,
+        str: StrNewIndex,
     ) -> Result<V::Value, DeserializeError> {
         self.level += 1;
         let access = EnumAccess {
@@ -208,120 +273,147 @@ impl<'de, R: io::Read> serde::Deserializer<'de> for &mut Deserializer<R> {
 
         match tag {
             TypeTag::Unit => visitor.visit_unit(),
-            TypeTag::BoolFalse => visitor.visit_bool(false),
-            TypeTag::BoolTrue => visitor.visit_bool(true),
-            TypeTag::U8 => {
-                let mut buf = [0u8];
+            TypeTag::Bool(b) => visitor.visit_bool(b),
+            TypeTag::Integer {
+                width: IntWidth::W8,
+                signed,
+                varint: false,
+            } => {
+                let mut buf = [0u8; 1];
                 self.reader.read_exact(&mut buf)?;
-                visitor.visit_u8(buf[0])
+                if signed {
+                    visitor.visit_i8(buf[0] as i8)
+                } else {
+                    visitor.visit_u8(buf[0])
+                }
             }
-            TypeTag::I8 => {
-                let mut buf = [0u8];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_i8(buf[0] as i8)
-            }
-            TypeTag::U16 => {
+            TypeTag::Integer {
+                width: IntWidth::W16,
+                signed,
+                varint: false,
+            } => {
                 let mut buf = [0u8; 2];
                 self.reader.read_exact(&mut buf)?;
-                visitor.visit_u16(u16::from_le_bytes(buf))
+                if signed {
+                    visitor.visit_i16(i16::from_le_bytes(buf))
+                } else {
+                    visitor.visit_u16(u16::from_le_bytes(buf))
+                }
             }
-            TypeTag::I16 => {
-                let mut buf = [0u8; 2];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_i16(i16::from_le_bytes(buf))
-            }
-            TypeTag::U32 => {
+            TypeTag::Integer {
+                width: IntWidth::W32,
+                signed,
+                varint: false,
+            } => {
                 let mut buf = [0u8; 4];
                 self.reader.read_exact(&mut buf)?;
-                visitor.visit_u32(u32::from_le_bytes(buf))
+                if signed {
+                    visitor.visit_i32(i32::from_le_bytes(buf))
+                } else {
+                    visitor.visit_u32(u32::from_le_bytes(buf))
+                }
             }
-            TypeTag::I32 => {
-                let mut buf = [0u8; 4];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_i32(i32::from_le_bytes(buf))
-            }
-            TypeTag::U64 => {
+            TypeTag::Integer {
+                width: IntWidth::W64,
+                signed,
+                varint: false,
+            } => {
                 let mut buf = [0u8; 8];
                 self.reader.read_exact(&mut buf)?;
-                visitor.visit_u64(u64::from_le_bytes(buf))
+                if signed {
+                    visitor.visit_i64(i64::from_le_bytes(buf))
+                } else {
+                    visitor.visit_u64(u64::from_le_bytes(buf))
+                }
             }
-            TypeTag::I64 => {
-                let mut buf = [0u8; 8];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_i64(i64::from_le_bytes(buf))
-            }
-            TypeTag::U128 => {
+            TypeTag::Integer {
+                width: IntWidth::W128,
+                signed,
+                varint: false,
+            } => {
                 let mut buf = [0u8; 16];
                 self.reader.read_exact(&mut buf)?;
-                visitor.visit_u128(u128::from_le_bytes(buf))
+                if signed {
+                    visitor.visit_i128(i128::from_le_bytes(buf))
+                } else {
+                    visitor.visit_u128(u128::from_le_bytes(buf))
+                }
             }
-            TypeTag::I128 => {
-                let mut buf = [0u8; 16];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_i128(i128::from_le_bytes(buf))
-            }
-            TypeTag::U16Var => {
-                let val = varint::read_unsigned_varint(&mut self.reader)?;
-                visitor.visit_u16(val)
-            }
-            TypeTag::I16Var => {
-                let val = varint::read_signed_varint(&mut self.reader)?;
-                visitor.visit_i16(val)
-            }
-            TypeTag::U32Var => {
-                let val = varint::read_unsigned_varint(&mut self.reader)?;
-                visitor.visit_u32(val)
-            }
-            TypeTag::I32Var => {
-                let val = varint::read_signed_varint(&mut self.reader)?;
-                visitor.visit_i32(val)
-            }
-            TypeTag::U64Var => {
-                let val = varint::read_unsigned_varint(&mut self.reader)?;
-                visitor.visit_u64(val)
-            }
-            TypeTag::I64Var => {
-                let val = varint::read_signed_varint(&mut self.reader)?;
-                visitor.visit_i64(val)
-            }
-            TypeTag::U128Var => {
-                let val = varint::read_unsigned_varint(&mut self.reader)?;
-                visitor.visit_u128(val)
-            }
-            TypeTag::I128Var => {
-                let val = varint::read_signed_varint(&mut self.reader)?;
-                visitor.visit_i128(val)
-            }
-            TypeTag::F32 => {
-                let mut buf = [0u8; 4];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_f32(f32::from_le_bytes(buf))
-            }
-            TypeTag::F64 => {
-                let mut buf = [0u8; 8];
-                self.reader.read_exact(&mut buf)?;
-                visitor.visit_f64(f64::from_le_bytes(buf))
-            }
-            TypeTag::Char32 => {
+            TypeTag::Integer {
+                width: IntWidth::W8,
+                signed: false,
+                varint: true,
+            } => visitor.visit_u8(varint::read_unsigned_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W16,
+                signed: false,
+                varint: true,
+            } => visitor.visit_u16(varint::read_unsigned_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W32,
+                signed: false,
+                varint: true,
+            } => visitor.visit_u32(varint::read_unsigned_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W64,
+                signed: false,
+                varint: true,
+            } => visitor.visit_u64(varint::read_unsigned_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W128,
+                signed: false,
+                varint: true,
+            } => visitor.visit_u128(varint::read_unsigned_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W8,
+                signed: true,
+                varint: true,
+            } => visitor.visit_i8(varint::read_signed_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W16,
+                signed: true,
+                varint: true,
+            } => visitor.visit_i16(varint::read_signed_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W32,
+                signed: true,
+                varint: true,
+            } => visitor.visit_i32(varint::read_signed_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W64,
+                signed: true,
+                varint: true,
+            } => visitor.visit_i64(varint::read_signed_varint(&mut self.reader)?),
+            TypeTag::Integer {
+                width: IntWidth::W128,
+                signed: true,
+                varint: true,
+            } => visitor.visit_i128(varint::read_signed_varint(&mut self.reader)?),
+            TypeTag::Char { varint: false } => {
                 let mut buf = [0u8; 4];
                 self.reader.read_exact(&mut buf)?;
                 let char =
                     char::from_u32(u32::from_le_bytes(buf)).ok_or(DeserializeError::InvalidChar)?;
                 visitor.visit_char(char)
             }
-            TypeTag::CharVar => {
+            TypeTag::Char { varint: true } => {
                 let val = varint::read_unsigned_varint(&mut self.reader)?;
                 let char = char::from_u32(val).ok_or(DeserializeError::InvalidChar)?;
                 visitor.visit_char(char)
             }
-            TypeTag::StrIndex => {
-                let str = self.read_str_by_index()?;
-                visitor.visit_str(str)
-            }
-            TypeTag::StrNew => {
-                let str = self.read_str_new()?;
-                visitor.visit_str(str)
-            }
+            TypeTag::Float(FloatWidth::F32) => {
+                let mut buf = [0u8; 4];
+                self.reader.read_exact(&mut buf)?;
+                visitor.visit_f32(f32::from_le_bytes(buf))
+            },
+            TypeTag::Float(FloatWidth::F64) => {
+                let mut buf = [0u8; 8];
+                self.reader.read_exact(&mut buf)?;
+                visitor.visit_f64(f64::from_le_bytes(buf))
+            },
+            TypeTag::Str(sni) => {
+                visitor.visit_str(&self.read_str(sni)?)
+            },
             TypeTag::StrDirect => {
                 let len = varint::read_unsigned_varint(&mut self.reader)?;
                 let mut data = vec![0u8; len];
@@ -329,29 +421,26 @@ impl<'de, R: io::Read> serde::Deserializer<'de> for &mut Deserializer<R> {
                 let string =
                     String::from_utf8(data).map_err(|_| DeserializeError::InvalidUTF8String)?;
                 visitor.visit_string(string)
-            }
-            TypeTag::EmptyStr => visitor.visit_borrowed_str(""),
+            },
+            TypeTag::EmptyStr => visitor.visit_str(""),
             TypeTag::Bytes => {
                 let len = varint::read_unsigned_varint(&mut self.reader)?;
                 let mut data = vec![0u8; len];
                 self.reader.read_exact(&mut data)?;
                 visitor.visit_byte_buf(data)
-            }
-            TypeTag::None => visitor.visit_none(),
-            TypeTag::Some => visitor.visit_some(self),
-            TypeTag::UnitStruct => visitor.visit_unit(),
-            TypeTag::UnitVariantStrIndex => {
-                self.visit_enum(visitor, EnumType::Unit, StringType::Index)
-            }
-            TypeTag::UnitVariantStrNew => self.visit_enum(visitor, EnumType::Unit, StringType::New),
-            TypeTag::NewtypeStruct => visitor.visit_newtype_struct(self),
-            TypeTag::NewtypeVariantStrIndex => {
-                self.visit_enum(visitor, EnumType::Newtype, StringType::Index)
-            }
-            TypeTag::NewtypeVariantStrNew => {
-                self.visit_enum(visitor, EnumType::Newtype, StringType::New)
-            }
-            TypeTag::Seq => {
+            },
+            TypeTag::Option(OptionTag::None) => visitor.visit_none(),
+            TypeTag::Option(OptionTag::Some) => visitor.visit_some(self),
+            TypeTag::Struct(StructType::Unit) => visitor.visit_unit(),
+            TypeTag::Struct(StructType::Newtype) => visitor.visit_newtype_struct(self),
+
+            TypeTag::Struct(StructType::Struct) => {
+                let len = varint::read_unsigned_varint(&mut self.reader)?;
+                self.visit_map(visitor, Some(len), true)
+            },
+
+            TypeTag::EnumVariant { ty, str } => self.visit_enum(visitor, ty, str),
+            TypeTag::Seq { has_length: false } => {
                 self.level += 1;
                 let seq = SeqAccess {
                     remaining: None,
@@ -360,8 +449,9 @@ impl<'de, R: io::Read> serde::Deserializer<'de> for &mut Deserializer<R> {
                     done: false,
                 };
                 visitor.visit_seq(seq)
-            }
-            TypeTag::LenSeq | TypeTag::Tuple | TypeTag::TupleStruct => {
+            },
+
+            TypeTag::Seq { has_length: true } | TypeTag::Tuple | TypeTag::Struct(StructType::Tuple) => {
                 let len = varint::read_unsigned_varint(&mut self.reader)?;
                 self.level += 1;
                 let seq = SeqAccess {
@@ -372,27 +462,11 @@ impl<'de, R: io::Read> serde::Deserializer<'de> for &mut Deserializer<R> {
                 };
                 visitor.visit_seq(seq)
             }
-            TypeTag::TupleVariantStrIndex => {
-                self.visit_enum(visitor, EnumType::Tuple, StringType::Index)
-            }
-            TypeTag::TupleVariantStrNew => {
-                self.visit_enum(visitor, EnumType::Tuple, StringType::New)
-            }
-            TypeTag::Map => self.visit_map(visitor, None, false),
-            TypeTag::LenMap => {
-                let len = varint::read_unsigned_varint(&mut self.reader)?;
-                self.visit_map(visitor, Some(len), false)
-            }
-            TypeTag::Struct => {
-                let len = varint::read_unsigned_varint(&mut self.reader)?;
-                self.visit_map(visitor, Some(len), true)
-            }
-            TypeTag::StructVariantStrIndex => {
-                self.visit_enum(visitor, EnumType::Struct, StringType::Index)
-            }
-            TypeTag::StructVariantStrNew => {
-                self.visit_enum(visitor, EnumType::Struct, StringType::New)
-            }
+
+            TypeTag::Map { has_length } => {
+                let len = has_length.then(|| varint::read_unsigned_varint(&mut self.reader)).transpose()?;
+                self.visit_map(visitor, len, false)
+            },
             TypeTag::End => Err(DeserializeError::ReadEnd),
         }
     }
@@ -550,12 +624,16 @@ impl<'de, R: io::Read> serde::Deserializer<'de> for &mut Deserializer<R> {
 
     fn deserialize_newtype_struct<V>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
+        if name == crate::raw::RAW_VALUE_MAGIC_STRING {
+            let buf = crate::raw::RawValue::deserialize_raw(self)?;
+            return visitor.visit_bytes(&buf);
+        }
         self.deserialize_any(visitor)
     }
 
@@ -638,7 +716,7 @@ struct SeqAccess<'a, R: io::Read> {
     level: usize,
 }
 
-impl<'a, 'de, R: io::Read> serde::de::SeqAccess<'de> for SeqAccess<'a, R> {
+impl<'de, R: io::Read> serde::de::SeqAccess<'de> for SeqAccess<'_, R> {
     type Error = DeserializeError;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
@@ -700,26 +778,12 @@ impl<'a, 'de, R: io::Read> serde::de::SeqAccess<'de> for SeqAccess<'a, R> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EnumType {
-    Unit,
-    Newtype,
-    Tuple,
-    Struct,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum StringType {
-    Index,
-    New,
-}
-
 struct EnumAccess<'a, R: io::Read> {
     de: &'a mut Deserializer<R>,
     level: usize,
 
-    ty: EnumType,
-    str_ty: StringType,
+    ty: StructType,
+    str_ty: StrNewIndex,
 }
 
 impl<'de, 'a, R: io::Read> serde::de::EnumAccess<'de> for EnumAccess<'a, R> {
@@ -750,11 +814,11 @@ struct VariantAccess<'a, R: io::Read> {
     de: &'a mut Deserializer<R>,
     level: usize,
 
-    ty: EnumType,
+    ty: StructType,
 }
 
-impl<'a, R: io::Read> VariantAccess<'a, R> {
-    fn assert_type(&self, ty: EnumType) -> Result<(), DeserializeError> {
+impl<R: io::Read> VariantAccess<'_, R> {
+    fn assert_type(&self, ty: StructType) -> Result<(), DeserializeError> {
         if self.ty != ty {
             Err(DeserializeError::WrongEnumVariantType {
                 tried: ty,
@@ -766,11 +830,11 @@ impl<'a, R: io::Read> VariantAccess<'a, R> {
     }
 }
 
-impl<'de, 'a, R: io::Read> serde::de::VariantAccess<'de> for VariantAccess<'a, R> {
+impl<'de, R: io::Read> serde::de::VariantAccess<'de> for VariantAccess<'_, R> {
     type Error = DeserializeError;
 
     fn unit_variant(self) -> Result<(), Self::Error> {
-        self.assert_type(EnumType::Unit)?;
+        self.assert_type(StructType::Unit)?;
         self.de.level -= 1;
         Ok(())
     }
@@ -779,7 +843,7 @@ impl<'de, 'a, R: io::Read> serde::de::VariantAccess<'de> for VariantAccess<'a, R
     where
         T: serde::de::DeserializeSeed<'de>,
     {
-        self.assert_type(EnumType::Newtype)?;
+        self.assert_type(StructType::Newtype)?;
         let val = seed.deserialize(&mut *self.de);
         self.de.level -= 1;
         val
@@ -789,7 +853,7 @@ impl<'de, 'a, R: io::Read> serde::de::VariantAccess<'de> for VariantAccess<'a, R
     where
         V: serde::de::Visitor<'de>,
     {
-        self.assert_type(EnumType::Tuple)?;
+        self.assert_type(StructType::Tuple)?;
         let len = varint::read_unsigned_varint(&mut self.de.reader)?;
         let seq = SeqAccess {
             remaining: Some(len),
@@ -826,27 +890,25 @@ struct StringDeserializer<'a, R: io::Read> {
     de: &'a mut Deserializer<R>,
 
     /// Deserialize a specific string on Some, or read a string tag and operate on that on None
-    str_ty: Option<StringType>,
+    str_ty: Option<StrNewIndex>,
 }
 
-impl<'a, R: io::Read> StringDeserializer<'a, R> {
-    fn read_str(self) -> Result<&'a str, DeserializeError> {
+impl<R: io::Read> StringDeserializer<'_, R> {
+    fn read_str(self) -> Result<Arc<str>, DeserializeError> {
         match self.str_ty {
-            Some(StringType::Index) => self.de.read_str_by_index(),
-            Some(StringType::New) => self.de.read_str_new(),
+            Some(s) => self.de.read_str(s).map_err(Into::into),
             None => {
                 let tag = self.de.read_tag()?;
                 match tag {
-                    TypeTag::StrIndex => self.de.read_str_by_index(),
-                    TypeTag::StrNew => self.de.read_str_new(),
-                    _ => Err(DeserializeError::Expected("str", tag)),
+                    TypeTag::Str(s) => self.de.read_str(s).map_err(Into::into),
+                    _ => Err(DeserializeError::Expected("str", tag.into())),
                 }
             }
         }
     }
 }
 
-impl<'de, 'a, R: io::Read> serde::de::Deserializer<'de> for StringDeserializer<'a, R> {
+impl<'de, R: io::Read> serde::de::Deserializer<'de> for StringDeserializer<'_, R> {
     type Error = DeserializeError;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -944,14 +1006,14 @@ impl<'de, 'a, R: io::Read> serde::de::Deserializer<'de> for StringDeserializer<'
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_str(self.read_str()?)
+        visitor.visit_str(&self.read_str()?)
     }
 
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        visitor.visit_string(self.read_str()?.into())
+        visitor.visit_string(self.read_str()?.deref().into())
     }
 
     fn deserialize_bytes<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
@@ -1086,7 +1148,7 @@ struct MapAccess<'a, R: io::Read> {
     done: bool,
 }
 
-impl<'de, 'a, R: io::Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
+impl<'de, R: io::Read> serde::de::MapAccess<'de> for MapAccess<'_, R> {
     type Error = DeserializeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>

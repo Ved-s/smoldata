@@ -1,6 +1,8 @@
-use std::{collections::HashMap, error::Error, fmt::Display, io};
+use std::{collections::HashMap, error::Error, fmt::Display, io, sync::Arc, ops::Deref};
 
-use crate::{varint, TypeTag, FORMAT_VERSION, MAGIC_HEADER};
+use crate::{
+    raw::RawValueReadingError, tag::{FlatTypeTag, FloatWidth, IntWidth, OptionTag, StrNewIndex, StructType, TypeTag}, varint, MaybeArcStr, FORMAT_VERSION, MAGIC_HEADER
+};
 
 const SERIALIZER_DEBUG_PRINT: bool = false;
 
@@ -35,6 +37,9 @@ pub enum SerializeError {
     #[error("Attempted to serialize map value when expected key")]
     KeyExpectedGotValue,
 
+    #[error("Error while reading a RawValue")]
+    RawValueReading(#[from] RawValueReadingError),
+
     #[error(transparent)]
     Custom(Box<dyn Error>),
 }
@@ -49,8 +54,8 @@ impl serde::ser::Error for SerializeError {
 }
 
 pub struct Serializer<W: io::Write> {
-    writer: W,
-    string_map: HashMap<Box<str>, u32>,
+    pub(crate) writer: W,
+    pub(crate) string_map: HashMap<Arc<str>, u32>,
     level: usize,
 
     next_map_index: u32,
@@ -58,51 +63,57 @@ pub struct Serializer<W: io::Write> {
 }
 
 impl<W: io::Write> Serializer<W> {
-
     /// Construct a new Serializer.<br>
     /// Writer preferred to be buffered, serialization does many small writes
     pub fn new(mut writer: W, max_cache_str_len: usize) -> Result<Self, io::Error> {
-
         writer.write_all(MAGIC_HEADER)?;
         writer.write_all(&[FORMAT_VERSION])?;
 
-        let this = Self {
+        let this = Self::new_bare(writer, max_cache_str_len);
+        serializer_debugprintln!(
+            this,
+            " -- Serializer debug log --\nversion: {FORMAT_VERSION}"
+        );
+
+        Ok(this)
+    }
+
+    pub(crate) fn new_bare(writer: W, max_cache_str_len: usize) -> Self {
+        Self {
             writer,
             string_map: Default::default(),
             level: 0,
 
             next_map_index: 0,
             max_cache_str_len,
-        };
-        serializer_debugprintln!(this, " -- Serializer debug log --\nversion: {FORMAT_VERSION}");
-
-        Ok(this)
+        }
     }
 
-    fn write_tag(&mut self, tag: TypeTag) -> Result<(), io::Error> {
+    pub(crate) fn write_tag(&mut self, tag: impl Into<FlatTypeTag>) -> Result<(), io::Error> {
+        let tag = tag.into();
         serializer_debugprintln!(self, "tag: {tag:?}");
         self.writer.write_all(&[tag.into()])
     }
 
-    fn write_cached_str(
+    pub(crate) fn write_cached_str<'a>(
         &mut self,
-        s: &str,
-        indextag: TypeTag,
-        newtag: TypeTag,
+        s: impl Into<MaybeArcStr<'a>>,
+        tagmaker: &dyn Fn(StrNewIndex) -> TypeTag,
     ) -> Result<(), io::Error> {
-        if let Some(index) = self.string_map.get(s).copied() {
-            self.write_tag(indextag)?;
-            serializer_debugprintln!(self, "index: {index} (\"{s}\")");
+        let s = s.into();
+        if let Some(index) = self.string_map.get(s.deref()).copied() {
+            self.write_tag(tagmaker(StrNewIndex::Index))?;
+            serializer_debugprintln!(self, "index: {index} (\"{}\")", s.deref());
             varint::write_unsigned_varint(&mut self.writer, index)?;
         } else {
             let index = self.next_map_index;
 
-            self.write_tag(newtag)?;
+            self.write_tag(tagmaker(StrNewIndex::New))?;
             varint::write_unsigned_varint(&mut self.writer, index)?;
             varint::write_unsigned_varint(&mut self.writer, s.len())?;
             self.writer.write_all(s.as_bytes())?;
 
-            serializer_debugprintln!(self, "string: {index} (\"{s}\")");
+            serializer_debugprintln!(self, "string: {index} (\"{}\")", s.deref());
 
             self.next_map_index += 1;
             self.string_map.insert(s.into(), index);
@@ -131,17 +142,17 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     type SerializeStructVariant = SerializeStructVariant<'a, W>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        if v {
-            self.write_tag(TypeTag::BoolTrue)?;
-        } else {
-            self.write_tag(TypeTag::BoolFalse)?;
-        }
+        self.write_tag(TypeTag::Bool(v))?;
 
         Ok(())
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::I8)?;
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W8,
+            signed: false,
+            varint: false,
+        })?;
         self.writer.write_all(&[v as u8])?;
 
         serializer_debugprintln!(self, "i8: {v}");
@@ -150,11 +161,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.unsigned_abs().leading_zeros(), 2, true) {
-            self.write_tag(TypeTag::I16Var)?;
+        let varint = is_varint_better(v.unsigned_abs().leading_zeros(), 2, true);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W16,
+            signed: true,
+            varint,
+        })?;
+        if varint {
             varint::write_signed_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::I16)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "i16: {v}");
@@ -162,11 +177,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.unsigned_abs().leading_zeros(), 4, true) {
-            self.write_tag(TypeTag::I32Var)?;
+        let varint = is_varint_better(v.unsigned_abs().leading_zeros(), 4, true);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W32,
+            signed: true,
+            varint,
+        })?;
+        if varint {
             varint::write_signed_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::I32)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "i32: {v}");
@@ -174,11 +193,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.unsigned_abs().leading_zeros(), 8, true) {
-            self.write_tag(TypeTag::I64Var)?;
+        let varint = is_varint_better(v.unsigned_abs().leading_zeros(), 8, true);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W64,
+            signed: true,
+            varint,
+        })?;
+        if varint {
             varint::write_signed_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::I64)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "i64: {v}");
@@ -186,11 +209,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.unsigned_abs().leading_zeros(), 16, true) {
-            self.write_tag(TypeTag::I128Var)?;
+        let varint = is_varint_better(v.unsigned_abs().leading_zeros(), 16, true);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W128,
+            signed: true,
+            varint,
+        })?;
+        if varint {
             varint::write_signed_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::I128)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "i128: {v}");
@@ -198,7 +225,11 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::U8)?;
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W8,
+            signed: false,
+            varint: false,
+        })?;
         self.writer.write_all(&[v])?;
 
         serializer_debugprintln!(self, "u8: {v}");
@@ -207,11 +238,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.leading_zeros(), 2, true) {
-            self.write_tag(TypeTag::U16Var)?;
+        let varint = is_varint_better(v.leading_zeros(), 2, false);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W16,
+            signed: false,
+            varint,
+        })?;
+        if varint {
             varint::write_unsigned_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::U16)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "u16: {v}");
@@ -219,11 +254,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.leading_zeros(), 4, true) {
-            self.write_tag(TypeTag::U32Var)?;
+        let varint = is_varint_better(v.leading_zeros(), 4, false);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W32,
+            signed: false,
+            varint,
+        })?;
+        if varint {
             varint::write_unsigned_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::U32)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "u32: {v}");
@@ -231,11 +270,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.leading_zeros(), 8, true) {
-            self.write_tag(TypeTag::U64Var)?;
+        let varint = is_varint_better(v.leading_zeros(), 8, false);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W64,
+            signed: false,
+            varint,
+        })?;
+        if varint {
             varint::write_unsigned_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::U64)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "u64: {v}");
@@ -243,11 +286,15 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        if is_varint_better(v.leading_zeros(), 16, true) {
-            self.write_tag(TypeTag::U128Var)?;
+        let varint = is_varint_better(v.leading_zeros(), 16, false);
+        self.write_tag(TypeTag::Integer {
+            width: IntWidth::W128,
+            signed: false,
+            varint,
+        })?;
+        if varint {
             varint::write_unsigned_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::U128)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
         serializer_debugprintln!(self, "u128: {v}");
@@ -255,7 +302,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::F32)?;
+        self.write_tag(TypeTag::Float(FloatWidth::F32))?;
         self.writer.write_all(&v.to_le_bytes())?;
 
         serializer_debugprintln!(self, "f32: {v}");
@@ -264,7 +311,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::F64)?;
+        self.write_tag(TypeTag::Float(FloatWidth::F64))?;
         self.writer.write_all(&v.to_le_bytes())?;
 
         serializer_debugprintln!(self, "f64: {v}");
@@ -275,11 +322,12 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
         let v = v as u32;
 
-        if is_varint_better(v.leading_zeros(), 4, true) {
-            self.write_tag(TypeTag::CharVar)?;
+        let varint = is_varint_better(v.leading_zeros(), 4, true);
+        self.write_tag(TypeTag::Char { varint })?;
+
+        if varint {
             varint::write_unsigned_varint(&mut self.writer, v)?;
         } else {
-            self.write_tag(TypeTag::Char32)?;
             self.writer.write_all(&v.to_le_bytes())?;
         }
 
@@ -296,7 +344,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
             self.writer.write_all(v.as_bytes())?;
             serializer_debugprintln!(self, "string: \"{v}\"");
         } else {
-            self.write_cached_str(v, TypeTag::StrIndex, TypeTag::StrNew)?;
+            self.write_cached_str(v, &|s| TypeTag::Str(s))?;
         }
 
         Ok(())
@@ -313,7 +361,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::None)?;
+        self.write_tag(TypeTag::Option(OptionTag::None))?;
 
         Ok(())
     }
@@ -322,7 +370,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     where
         T: ?Sized + serde::Serialize,
     {
-        self.write_tag(TypeTag::Some)?;
+        self.write_tag(TypeTag::Option(OptionTag::Some))?;
         value.serialize(self)
     }
 
@@ -333,7 +381,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        self.write_tag(TypeTag::UnitStruct)?;
+        self.write_tag(TypeTag::Struct(StructType::Unit))?;
 
         Ok(())
     }
@@ -344,24 +392,31 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        self.write_cached_str(
-            variant,
-            TypeTag::UnitVariantStrIndex,
-            TypeTag::UnitVariantStrNew,
-        )?;
+        self.write_cached_str(variant, &|str| TypeTag::EnumVariant {
+            ty: StructType::Unit,
+            str,
+        })?;
 
         Ok(())
     }
 
     fn serialize_newtype_struct<T>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Self::Ok, Self::Error>
     where
         T: ?Sized + serde::Serialize,
     {
-        self.write_tag(TypeTag::NewtypeStruct)?;
+
+        if name == crate::raw::RAW_VALUE_MAGIC_STRING {
+            let ser = crate::raw::RawValueSerializer {
+                ser: self,
+            };
+            return value.serialize(ser);
+        }
+
+        self.write_tag(TypeTag::Struct(StructType::Newtype))?;
         value.serialize(self)
     }
 
@@ -375,22 +430,20 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     where
         T: ?Sized + serde::Serialize,
     {
-        self.write_cached_str(
-            variant,
-            TypeTag::NewtypeVariantStrIndex,
-            TypeTag::NewtypeVariantStrNew,
-        )?;
+        self.write_cached_str(variant, &|str| TypeTag::EnumVariant {
+            ty: StructType::Newtype,
+            str,
+        })?;
         value.serialize(self)
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        match len {
-            None => self.write_tag(TypeTag::Seq)?,
-            Some(len) => {
-                self.write_tag(TypeTag::LenSeq)?;
-                serializer_debugprintln!(self, "len: {len}");
-                varint::write_unsigned_varint(&mut self.writer, len)?;
-            }
+        self.write_tag(TypeTag::Seq {
+            has_length: len.is_some(),
+        })?;
+        if let Some(len) = len {
+            serializer_debugprintln!(self, "len: {len}");
+            varint::write_unsigned_varint(&mut self.writer, len)?;
         }
         self.level += 1;
         Ok(SerializeSeq {
@@ -417,7 +470,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        self.write_tag(TypeTag::TupleStruct)?;
+        self.write_tag(TypeTag::Struct(StructType::Tuple))?;
         varint::write_unsigned_varint(&mut self.writer, len)?;
         serializer_debugprintln!(self, "len: {len}");
         self.level += 1;
@@ -435,11 +488,10 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        self.write_cached_str(
-            variant,
-            TypeTag::TupleVariantStrIndex,
-            TypeTag::TupleVariantStrNew,
-        )?;
+        self.write_cached_str(variant, &|str| TypeTag::EnumVariant {
+            ty: StructType::Tuple,
+            str,
+        })?;
         varint::write_unsigned_varint(&mut self.writer, len)?;
         serializer_debugprintln!(self, "len: {len}");
         self.level += 1;
@@ -451,13 +503,12 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        match len {
-            None => self.write_tag(TypeTag::Map)?,
-            Some(len) => {
-                self.write_tag(TypeTag::LenMap)?;
-                varint::write_unsigned_varint(&mut self.writer, len)?;
-                serializer_debugprintln!(self, "len: {len}");
-            }
+        self.write_tag(TypeTag::Map {
+            has_length: len.is_some(),
+        })?;
+        if let Some(len) = len {
+            serializer_debugprintln!(self, "len: {len}");
+            varint::write_unsigned_varint(&mut self.writer, len)?;
         }
 
         self.level += 1;
@@ -474,7 +525,7 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
-        self.write_tag(TypeTag::Struct)?;
+        self.write_tag(TypeTag::Struct(StructType::Struct))?;
         varint::write_unsigned_varint(&mut self.writer, len)?;
         serializer_debugprintln!(self, "len: {len}");
 
@@ -493,11 +544,10 @@ impl<'a, W: io::Write> serde::Serializer for &'a mut Serializer<W> {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        self.write_cached_str(
-            variant,
-            TypeTag::StructVariantStrIndex,
-            TypeTag::StructVariantStrNew,
-        )?;
+        self.write_cached_str(variant, &|str| TypeTag::EnumVariant {
+            ty: StructType::Struct,
+            str,
+        })?;
         varint::write_unsigned_varint(&mut self.writer, len)?;
         serializer_debugprintln!(self, "len: {len}");
 
@@ -520,7 +570,7 @@ pub struct SerializeSeq<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeSeq for SerializeSeq<'a, W> {
+impl<W: io::Write> serde::ser::SerializeSeq for SerializeSeq<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -565,7 +615,7 @@ pub struct SerializeTuple<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeTuple for SerializeTuple<'a, W> {
+impl<W: io::Write> serde::ser::SerializeTuple for SerializeTuple<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -606,7 +656,7 @@ pub struct SerializeTupleStruct<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeTupleStruct for SerializeTupleStruct<'a, W> {
+impl<W: io::Write> serde::ser::SerializeTupleStruct for SerializeTupleStruct<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -647,7 +697,7 @@ pub struct SerializeTupleVariant<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeTupleVariant for SerializeTupleVariant<'a, W> {
+impl<W: io::Write> serde::ser::SerializeTupleVariant for SerializeTupleVariant<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -690,7 +740,7 @@ pub struct SerializeMap<'a, W: io::Write> {
     value_next: bool,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeMap for SerializeMap<'a, W> {
+impl<W: io::Write> serde::ser::SerializeMap for SerializeMap<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -760,7 +810,7 @@ pub struct SerializeStruct<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeStruct for SerializeStruct<'a, W> {
+impl<W: io::Write> serde::ser::SerializeStruct for SerializeStruct<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -779,7 +829,7 @@ impl<'a, W: io::Write> serde::ser::SerializeStruct for SerializeStruct<'a, W> {
 
         self.remaining -= 1;
 
-        self.ser.write_cached_str(key, TypeTag::StrIndex, TypeTag::StrNew)?;
+        self.ser.write_cached_str(key, &TypeTag::Str)?;
         value.serialize(&mut *self.ser)?;
 
         Ok(())
@@ -802,7 +852,7 @@ pub struct SerializeStructVariant<'a, W: io::Write> {
     level: usize,
 }
 
-impl<'a, W: io::Write> serde::ser::SerializeStructVariant for SerializeStructVariant<'a, W> {
+impl<W: io::Write> serde::ser::SerializeStructVariant for SerializeStructVariant<'_, W> {
     type Ok = ();
 
     type Error = SerializeError;
@@ -821,7 +871,7 @@ impl<'a, W: io::Write> serde::ser::SerializeStructVariant for SerializeStructVar
 
         self.remaining -= 1;
 
-        self.ser.write_cached_str(key, TypeTag::StrIndex, TypeTag::StrNew)?;
+        self.ser.write_cached_str(key, &TypeTag::Str)?;
         value.serialize(&mut *self.ser)?;
 
         Ok(())

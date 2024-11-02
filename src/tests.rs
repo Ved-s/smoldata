@@ -2,6 +2,8 @@ use std::{collections::HashMap, fmt, io};
 
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
+use crate::{RawValue, FORMAT_VERSION};
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum Enum {
     A(i32),
@@ -16,6 +18,14 @@ enum Enum {
 struct Struct {
     values: HashMap<i32, String>,
     e: Vec<Enum>,
+    tup: (bool, u128)
+}
+
+#[allow(unused)]
+#[derive(Debug, Serialize, Deserialize)]
+struct StructWithRaw {
+    values: HashMap<i32, String>,
+    e: RawValue,
     tup: (bool, u128)
 }
 
@@ -72,6 +82,67 @@ fn test_reserialize_complex() {
         tup: (false, 786583289812096971589793284203998369),
     };
     test_reserialize(&data);
+}
+
+#[test]
+fn test_raw() {
+    let data = Struct {
+        values: HashMap::from_iter([
+            (0, "somelongstring".into()),
+            (1, "somelongstring".into()),
+            (2, "somelongstring".into()),
+        ]),
+        e: vec![
+            Enum::D {
+                v: NoLenSerialize(vec![0, 5, 10, 15])
+            },
+            Enum::C("somelongstring".into(), 32, 64),
+            Enum::A(11),
+            Enum::B,
+            Enum::A(0),
+            Enum::B,
+        ],
+        tup: (false, 786583289812096971589793284203998369),
+    };
+
+    println!("Starting data: {data:?}\n");
+    
+    let mut vec = vec![];
+    let mut ser = super::ser::Serializer::new(&mut vec, 256).unwrap();
+    data.serialize(&mut ser).unwrap();
+
+    println!("Serialized data:");
+    hexdump(&vec);
+
+    let mut de = super::de::Deserializer::new(io::Cursor::new(vec)).unwrap();
+    let with_raw = StructWithRaw::deserialize(&mut de).unwrap();
+
+    println!("RawValue data:");
+    hexdump(with_raw.e.bytes());
+
+    let mut de = super::de::Deserializer::new_bare(io::Cursor::new(with_raw.e.bytes()), FORMAT_VERSION);
+    let inner = Vec::<Enum>::deserialize(&mut de).unwrap();
+
+    println!("Deserialized RawValue: {inner:?}\n");
+
+    let mut re_vec = vec![];
+    let mut ser = super::ser::Serializer::new(&mut re_vec, 256).unwrap();
+    with_raw.serialize(&mut ser).unwrap();
+
+    println!("Reserialized data bytes:");
+    hexdump(&re_vec);
+
+    let mut de = super::de::Deserializer::new(io::Cursor::new(re_vec)).unwrap();
+    let reserialized = Struct::deserialize(&mut de).unwrap();
+
+    println!("Reserialized data: {data:?}\n");
+
+    if reserialized != data {
+        panic!("DATA MISMATCH!")
+    }
+
+    println!("Data matches")
+
 }
 
 fn test_reserialize<'de, T: Serialize + Deserialize<'de> + Eq + fmt::Debug>(data: &T) {
