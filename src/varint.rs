@@ -308,6 +308,20 @@ pub fn copy_varint<S: io::Read, D: io::Write>(src: &mut S, dst: &mut D) -> Resul
 }
 
 
+pub fn is_varint_better(abs_leading_zeros: u32, bytewidth: u32, signed: bool) -> bool {
+    let value_width = bytewidth * 8 - abs_leading_zeros;
+
+    let rem_value_width = if signed {
+        value_width.saturating_sub(6)
+    } else {
+        value_width.saturating_sub(7)
+    };
+
+    let extra_varint_bytes = rem_value_width.div_ceil(7);
+
+    bytewidth > (extra_varint_bytes + 1)
+}
+
 macro_rules! impl_varint_primitives {
     ($($signed:ident:$unsigned:ident),*) => {
 
@@ -489,5 +503,37 @@ mod tests {
         let bit_value = u64::from_le_bytes(bytes);
 
         assert_eq!(bit_value, value, "{bit_value:x} != {value:x}");
+    }
+
+    #[test]
+    fn test_is_varint_better() {
+        let varint_short_values = [0x0u16, 0x7f, 0x0f];
+        let varint_long_values = [0x80u16, 0xff];
+
+        for v in varint_short_values {
+            assert!(is_varint_better(v.leading_zeros(), 2, false));
+        }
+
+        for v in varint_long_values {
+            assert!(!is_varint_better(v.leading_zeros(), 2, false));
+        }
+
+        let varint_shorter_values = [0x0u16, 0x3f, 0x0f];
+        for v in varint_shorter_values {
+            assert!(is_varint_better(v.leading_zeros(), 2, true));
+        }
+
+        assert!(!is_varint_better(0x7fu16.leading_zeros(), 2, true));
+
+        let varint_short_values = [0x0u32, 0xffff, 0x0f];
+        let varint_long_values = [0b1_0000000_0000000_0000000u32, 0xffffffff];
+
+        for v in varint_short_values {
+            assert!(is_varint_better(v.leading_zeros(), 4, false));
+        }
+
+        for v in varint_long_values {
+            assert!(!is_varint_better(v.leading_zeros(), 4, false));
+        }
     }
 }

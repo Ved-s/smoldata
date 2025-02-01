@@ -1,3 +1,5 @@
+use std::{io, slice};
+
 use crate::define_tag;
 
 define_tag! {
@@ -64,8 +66,6 @@ define_tag! {
         #[doc = "`i128`, 16 bytes of Little Endian encoded `i128` follows"]
         I128 = 12,
 
-
-
         #[unpack(exact Integer { width: IntWidth::W16, signed: false, varint: true })]
         #[doc = "`u16`, varint encoded `u16` follows"]
         U16Var = 13,
@@ -114,106 +114,93 @@ define_tag! {
         #[doc = "`char as u32`, varint encoded `u32` follows"]
         CharVar = 24,
 
-        #[unpack(exact Str(StrNewIndex::Index))]
-        #[doc = "String index in string map as `u32`, varint encoded `u32` follow"]
-        StrIndex = 25,
-
-        #[unpack(exact Str(StrNewIndex::New))]
-        #[doc = "New string for string map,"]
-        #[doc = " index as varint encoded `u32`,"]
+        #[unpack(exact Str)]
+        #[doc = "Signed varint encoded `u32` id follows, depending on the sign:"]
+        #[doc = ""]
+        #[doc = "Positive: String id in the string map"]
+        #[doc = ""]
+        #[doc = "Negative: Index for a string for the string map,"]
+        #[doc = ""]
         #[doc = " strlen as varint encoded `usize`"]
+        #[doc = ""]
         #[doc = " and string data encoded as utf8 follow"]
-        StrNew = 26,
+        Str = 25,
 
         #[unpack(exact StrDirect)]
         #[doc = "New string without caching,"]
         #[doc = " strlen as varint encoded `usize`"]
         #[doc = " and string data encoded as utf8 follow"]
-        StrDirect = 27,
+        StrDirect = 26,
 
         #[unpack(exact EmptyStr)]
         #[doc = "\"\", no data"]
-        EmptyStr = 28,
+        EmptyStr = 27,
 
         #[unpack(exact Bytes)]
         #[doc = "`[u8]`, length as varint encoded `usize` and byte data follow"]
-        Bytes = 29,
+        Bytes = 28,
 
         #[unpack(exact Option(OptionTag::None))]
         #[doc = "`Option::None`, no data"]
-        None = 30,
+        None = 29,
 
         #[unpack(exact Option(OptionTag::Some))]
         #[doc = "`Option::Some`, object follows"]
-        Some = 31,
+        Some = 30,
 
         #[unpack(exact Struct(StructType::Unit))]
         #[doc = "unit struct, no data"]
-        UnitStruct = 32,
+        UnitStruct = 31,
 
-        #[unpack(exact EnumVariant { ty: StructType::Unit, str: StrNewIndex::Index })]
-        #[doc = "unit variant, name as `Self::StrIndex` data follows"]
-        UnitVariantStrIndex = 33,
-
-        #[unpack(exact EnumVariant { ty: StructType::Unit, str: StrNewIndex::New })]
-        #[doc = "unit variant, name as `Self::StrNew` data follows"]
-        UnitVariantStrNew = 34,
+        #[unpack(exact EnumVariant(StructType::Unit))]
+        #[doc = "unit variant, name as `Self::Str` data follows"]
+        UnitVariant = 32,
 
         #[unpack(exact Struct(StructType::Newtype))]
         #[doc = "newtype struct, object follows"]
-        NewtypeStruct = 35,
+        NewtypeStruct = 33,
 
-        #[unpack(exact EnumVariant { ty: StructType::Newtype, str: StrNewIndex::Index })]
-        #[doc = "newtype variant, name as `Self::StrIndex` data and object follow"]
-        NewtypeVariantStrIndex = 36,
+        #[unpack(exact EnumVariant(StructType::Newtype))]
+        #[doc = "newtype variant, name as `Self::Str` data and object follow"]
+        NewtypeVariant = 34,
 
-        #[unpack(exact EnumVariant { ty: StructType::Newtype, str: StrNewIndex::New })]
-        #[doc = "newtype variant, name as `Self::StrNew` data and object follow"]
-        NewtypeVariantStrNew = 37,
-
-        #[unpack(exact Seq { has_length: false })]
+        #[unpack(exact Array { has_length: false })]
         #[doc = "`[T]`, objects follow until End tag"]
-        Seq = 38,
+        Array = 35,
 
-        #[unpack(exact Seq { has_length: true })]
+        #[unpack(exact Array { has_length: true })]
         #[doc = "`[T]`, length as varint encoded usize and objects follow"]
-        LenSeq = 39,
+        LenArray = 36,
 
         #[unpack(exact Tuple)]
         #[doc = "`(T, ...)`, length as varint encoded usize and objects follow"]
-        Tuple = 40,
+        Tuple = 37,
 
         #[unpack(exact Struct(StructType::Tuple))]
         #[doc = "tuple struct, `Self::Tuple` data follows"]
-        TupleStruct = 41,
+        TupleStruct = 38,
 
-        #[unpack(exact EnumVariant { ty: StructType::Tuple, str: StrNewIndex::Index })]
-        #[doc = "tuple variant, name as `Self::StrIndex` data and `Self::Tuple` data follow"]
-        TupleVariantStrIndex = 42,
-
-        #[unpack(exact EnumVariant { ty: StructType::Tuple, str: StrNewIndex::New })]
-        #[doc = "tuple variant, name as `Self::StrNew` data and `Self::Tuple` data follow"]
-        TupleVariantStrNew = 43,
+        #[unpack(exact EnumVariant(StructType::Tuple))]
+        #[doc = "tuple variant, name as `Self::Str` data and `Self::Tuple` data follow"]
+        TupleVariant = 39,
 
         #[unpack(exact Map { has_length: false })]
         #[doc = "`[(T, T)]`, pairs of key-value objects follow until End tag"]
-        Map = 44,
+        Map = 40,
 
         #[unpack(exact Map { has_length: true })]
         #[doc = "`[(T, T)]`, length as varint encoded usize and pairs of key-value objects follow"]
-        LenMap = 45,
+        LenMap = 41,
 
         #[unpack(exact Struct(StructType::Struct))]
         #[doc = "`[(String, T)]`, length as varint encoded `usize` and pairs of key-value strings and objects follow"]
-        Struct = 46,
+        #[doc = ""]
+        #[doc = "Strings are encoded without tags, only `Self::Str` data"]
+        Struct = 42,
 
-        #[unpack(exact EnumVariant { ty: StructType::Struct, str: StrNewIndex::Index })]
-        #[doc = "struct variant, name as `Self::StrIndex` data and `Self::Struct` data follow"]
-        StructVariantStrIndex = 47,
-
-        #[unpack(exact EnumVariant { ty: StructType::Struct, str: StrNewIndex::New })]
-        #[doc = "struct variant, name as `Self::StrNew` data and `Self::Struct` data follow"]
-        StructVariantStrNew = 48,
+        #[unpack(exact EnumVariant(StructType::Struct))]
+        #[doc = "struct variant, name as `Self::Str` data and `Self::Struct` data follow"]
+        StructVariant = 43,
 
         #[unpack(exact End)]
         #[doc = "End marker for Seq and Map"]
@@ -273,6 +260,15 @@ pub enum OptionTag {
     Some,
 }
 
+impl OptionTag {
+    pub fn from_option<T>(op: &Option<T>) -> Self {
+        match op {
+            Some(_) => Self::Some,
+            None => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructType {
     Unit,
@@ -296,17 +292,14 @@ pub enum TypeTag {
         varint: bool,
     },
     Float(FloatWidth),
-    Str(StrNewIndex),
+    Str,
     StrDirect,
     EmptyStr,
     Bytes,
     Option(OptionTag),
     Struct(StructType),
-    EnumVariant {
-        ty: StructType,
-        str: StrNewIndex,
-    },
-    Seq {
+    EnumVariant(StructType),
+    Array {
         has_length: bool,
     },
     Tuple,
@@ -316,49 +309,21 @@ pub enum TypeTag {
     End,
 }
 
+
+#[derive(Debug, thiserror::Error)]
+pub enum TagReadError {
+    #[error(transparent)]
+    IoError(#[from] io::Error),
+    
+    #[error(transparent)]
+    InvalidTagError(#[from] InvalidTagError)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid tag value {0}")]
+pub struct InvalidTagError(u8);
+
 impl TypeTag {
-    pub const fn get_str(self) -> Option<StrNewIndex> {
-        match self {
-            TypeTag::Unit => None,
-            TypeTag::Bool(_) => None,
-            TypeTag::Integer { .. } => None,
-            TypeTag::Char { .. } => None,
-            TypeTag::Float(_) => None,
-            TypeTag::Str(s) => Some(s),
-            TypeTag::StrDirect => None,
-            TypeTag::EmptyStr => None,
-            TypeTag::Bytes => None,
-            TypeTag::Option(_) => None,
-            TypeTag::Struct(_) => None,
-            TypeTag::EnumVariant { str, .. } => Some(str),
-            TypeTag::Seq { .. } => None,
-            TypeTag::Tuple => None,
-            TypeTag::Map { .. } => None,
-            TypeTag::End => None,
-        }
-    }
-
-    pub fn get_str_mut(&mut self) -> Option<&mut StrNewIndex> {
-        match self {
-            TypeTag::Unit => None,
-            TypeTag::Bool(_) => None,
-            TypeTag::Integer { .. } => None,
-            TypeTag::Char { .. } => None,
-            TypeTag::Float(_) => None,
-            TypeTag::Str(s) => Some(s),
-            TypeTag::StrDirect => None,
-            TypeTag::EmptyStr => None,
-            TypeTag::Bytes => None,
-            TypeTag::Option(_) => None,
-            TypeTag::Struct(_) => None,
-            TypeTag::EnumVariant { str, .. } => Some(str),
-            TypeTag::Seq { .. } => None,
-            TypeTag::Tuple => None,
-            TypeTag::Map { .. } => None,
-            TypeTag::End => None,
-        }
-    }
-
     #[rustfmt::skip]
     pub const fn tag_params(self) -> &'static [TagParameter] {
         match self {
@@ -384,8 +349,7 @@ impl TypeTag {
             TypeTag::Float(FloatWidth::F32) => &[TagParameter::FixedIntBytes(IntWidth::W32)],
             TypeTag::Float(FloatWidth::F64) => &[TagParameter::FixedIntBytes(IntWidth::W64)],
 
-            TypeTag::Str(StrNewIndex::New) => &[TagParameter::Varint, TagParameter::VarintLengthPrefixedBytearray],
-            TypeTag::Str(StrNewIndex::Index) => &[TagParameter::Varint],
+            TypeTag::Str => &[TagParameter::StringRef],
             TypeTag::StrDirect => &[TagParameter::VarintLengthPrefixedBytearray],
             TypeTag::EmptyStr => &[],
 
@@ -398,30 +362,33 @@ impl TypeTag {
             TypeTag::Struct(StructType::Tuple) => &[TagParameter::Varint],
             TypeTag::Struct(StructType::Struct) => &[TagParameter::Varint],
 
-            TypeTag::EnumVariant { ty: StructType::Unit, str: StrNewIndex::New } 
-                => &[TagParameter::Varint, TagParameter::VarintLengthPrefixedBytearray],
-            TypeTag::EnumVariant { ty: StructType::Newtype, str: StrNewIndex::New } 
-                => &[TagParameter::Varint, TagParameter::VarintLengthPrefixedBytearray],
-            TypeTag::EnumVariant { ty: StructType::Tuple, str: StrNewIndex::New } 
-                => &[TagParameter::Varint, TagParameter::VarintLengthPrefixedBytearray, TagParameter::Varint],
-            TypeTag::EnumVariant { ty: StructType::Struct, str: StrNewIndex::New } 
-                => &[TagParameter::Varint, TagParameter::VarintLengthPrefixedBytearray, TagParameter::Varint],
-            TypeTag::EnumVariant { ty: StructType::Unit, str: StrNewIndex::Index } 
-                => &[TagParameter::Varint],
-            TypeTag::EnumVariant { ty: StructType::Newtype, str: StrNewIndex::Index } 
-                => &[TagParameter::Varint],
-            TypeTag::EnumVariant { ty: StructType::Tuple, str: StrNewIndex::Index } 
-                => &[TagParameter::Varint, TagParameter::Varint],
-            TypeTag::EnumVariant { ty: StructType::Struct, str: StrNewIndex::Index } 
-                => &[TagParameter::Varint, TagParameter::Varint],
+            TypeTag::EnumVariant(StructType::Unit) 
+                => &[TagParameter::StringRef],
+            TypeTag::EnumVariant(StructType::Newtype) 
+                => &[TagParameter::StringRef],
+            TypeTag::EnumVariant(StructType::Tuple) 
+                => &[TagParameter::StringRef, TagParameter::Varint],
+            TypeTag::EnumVariant(StructType::Struct) 
+                => &[TagParameter::StringRef, TagParameter::Varint],
 
-            TypeTag::Seq { has_length: true } => &[TagParameter::Varint],
-            TypeTag::Seq { has_length: false } => &[],
+            TypeTag::Array { has_length: true } => &[TagParameter::Varint],
+            TypeTag::Array { has_length: false } => &[],
             TypeTag::Tuple => &[TagParameter::Varint],
             TypeTag::Map { has_length: true } => &[TagParameter::Varint],
             TypeTag::Map { has_length: false } => &[],
             TypeTag::End => &[],
         }
+    }
+
+    pub fn write<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&[self.pack().into()])
+    }
+
+    pub fn read<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, TagReadError> {
+        let mut byte = 0u8;
+        reader.read_exact(slice::from_mut(&mut byte))?;
+        let packed = FlatTypeTag::try_from(byte).map_err(|v| TagReadError::InvalidTagError(InvalidTagError(v)))?;
+        Ok(packed.into())
     }
 }
 
@@ -429,33 +396,5 @@ pub enum TagParameter {
     FixedIntBytes(IntWidth),
     Varint,
     VarintLengthPrefixedBytearray,
+    StringRef,
 }
-
-#[allow(clippy::len_zero)]
-pub const _VALIDATE_STR: () = {
-    let mut i = 0;
-
-    while i < FlatTypeTag::ALL.len() {
-        let tag = FlatTypeTag::ALL[i].unpack();
-        let Some(str) = tag.get_str() else {
-            i += 1;
-            continue;
-        };
-
-        let args = tag.tag_params();
-
-        match str {
-            StrNewIndex::New => {
-                assert!(args.len() >= 2);
-                assert!(matches!(args[0], TagParameter::Varint));
-                assert!(matches!(args[1], TagParameter::VarintLengthPrefixedBytearray));
-            },
-            StrNewIndex::Index => {
-                assert!(args.len() >= 1);
-                assert!(matches!(args[0], TagParameter::Varint));
-            },
-        }
-
-        i += 1;
-    }
-};
