@@ -1,7 +1,7 @@
 use std::{any::type_name, collections::HashMap, hash::Hash, io, ops::Deref};
 
 use smoldata::{
-    reader::{ReadError, ReadResult, UnexpectedValueResultExt, ValueReader},
+    reader::{ReadError, ReadResult, Reader, UnexpectedValueResultExt, ValueReader},
     writer::{ValueWriter, Writer},
 };
 
@@ -40,12 +40,23 @@ fn main() {
         tup: (false, 786583289812096971589793284203998369),
     };
 
+    println!("write: {data:?}");
+
     let mut writer = Writer::new(vec![]);
     data.write(writer.write()).unwrap();
 
     let vec = writer.finish();
 
+    println!("written {} bytes:", vec.len());
     hexdump(&vec);
+
+    std::fs::write("sd.bin", &vec).unwrap();
+
+    let mut reader = Reader::new(io::Cursor::new(&vec));
+
+    let struc = Struct::read(reader.read()).unwrap();
+
+    println!("read: {struc:?}");
 }
 
 fn hexdump(bytes: &[u8]) {
@@ -134,13 +145,13 @@ impl SdRead for Struct {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let mut struc = reader
             .read()?
-            .take_struct()
+            .take_field_struct()
             .with_type_name_of::<Self>()
             .map_err(ReadError::from)?;
 
-        let mut f_values = None::<HashMap<i32, String>>;
-        let mut f_e = None::<Vec<Enum>>;
-        let mut f_tup = None::<(bool, u128)>;
+        let mut f_values = None;
+        let mut f_e = None;
+        let mut f_tup = None;
 
         while let Some(field) = struc.read_field()? {
             match field.0.deref() {
@@ -187,34 +198,138 @@ impl SdRead for Struct {
             }
         }
 
-        let f_values = f_values.ok_or_else(|| {
-            ReadError::MissingStructField {
-                name: "values",
-                type_name: type_name::<Self>(),
-            }
-            .into()
+        let f_values = f_values.ok_or_else(|| ReadError::MissingStructField {
+            name: "values",
+            type_name: type_name::<Self>(),
         })?;
 
-        let f_e = f_e.ok_or_else(|| {
-            ReadError::MissingStructField {
-                name: "e",
-                type_name: type_name::<Self>(),
-            }
-            .into()
+        let f_e = f_e.ok_or_else(|| ReadError::MissingStructField {
+            name: "e",
+            type_name: type_name::<Self>(),
         })?;
 
-        let f_tup = f_tup.ok_or_else(|| {
-            ReadError::MissingStructField {
-                name: "tup",
-                type_name: type_name::<Self>(),
-            }
-            .into()
+        let f_tup = f_tup.ok_or_else(|| ReadError::MissingStructField {
+            name: "tup",
+            type_name: type_name::<Self>(),
         })?;
 
         Ok(Self {
             values: f_values,
             e: f_e,
             tup: f_tup,
+        })
+    }
+}
+
+impl SdRead for Enum {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        let var = reader
+            .read()?
+            .take_enum()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?
+            .read_variant()?;
+
+        Ok(match var.0.deref() {
+            "A" => Self::A(SdRead::read(
+                var.1
+                    .take_newtype_variant()
+                    .with_variant_name(type_name::<Enum>(), "A")
+                    .map_err(ReadError::from)?,
+            )?),
+            "B" => {
+                var.1
+                    .take_unit_variant()
+                    .with_variant_name(type_name::<Enum>(), "B")
+                    .map_err(ReadError::from)?;
+                Self::B
+            }
+            "C" => {
+                let mut tuple = var
+                    .1
+                    .take_tuple_variant()
+                    .with_variant_name(type_name::<Enum>(), "C")
+                    .map_err(ReadError::from)?;
+
+                let length = tuple.remaining();
+                'read: {
+                    if length != 3 {
+                        break 'read;
+                    }
+
+                    let Some(reader) = tuple.read_value() else {
+                        break 'read;
+                    };
+
+                    let v1 = SdRead::read(reader)?;
+
+                    let Some(reader) = tuple.read_value() else {
+                        break 'read;
+                    };
+
+                    let v2 = SdRead::read(reader)?;
+
+                    let Some(reader) = tuple.read_value() else {
+                        break 'read;
+                    };
+
+                    let v3 = SdRead::read(reader)?;
+
+                    return Ok(Self::C(v1, v2, v3));
+                }
+
+                return Err(ReadError::UnexpectedLength {
+                    expected: 3,
+                    got: length,
+                    type_name: type_name::<Self>(),
+                }
+                .into());
+            }
+            "D" => {
+                let mut struc = var
+                    .1
+                    .take_field_variant()
+                    .with_variant_name(type_name::<Enum>(), "D")
+                    .map_err(ReadError::from)?;
+
+                let mut f_v = None;
+
+                while let Some(field) = struc.read_field()? {
+                    match field.0.deref() {
+                        "v" => {
+                            if f_v.is_some() {
+                                return Err(ReadError::DuplicateStructField {
+                                    name: "v",
+                                    type_name: type_name::<Self>(),
+                                }
+                                .into());
+                            }
+                            f_v = Some(SdRead::read(field.1)?);
+                        }
+                        _ => {
+                            return Err(ReadError::UnexpectedStructField {
+                                name: field.0,
+                                type_name: type_name::<Self>(),
+                            }
+                            .into())
+                        }
+                    }
+                }
+
+                let f_v = f_v.ok_or_else(|| ReadError::MissingStructField {
+                    name: "v",
+                    type_name: type_name::<Self>(),
+                })?;
+
+                Self::D { v: f_v }
+            }
+            _ => {
+                return Err(ReadError::UnexpectedEnumVariant {
+                    name: var.0,
+                    type_name: type_name::<Self>(),
+                }
+                .into())
+            }
         })
     }
 }

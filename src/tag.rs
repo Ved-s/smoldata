@@ -1,7 +1,5 @@
 use std::{io, slice};
 
-use crate::define_tag;
-
 define_tag! {
     #[repr(u8)]
     #[unpack(TypeTag)]

@@ -1,5 +1,9 @@
 // pub mod de;
+
+#[macro_use]
 mod macros;
+mod tag;
+
 // pub mod ser;
 pub mod varint;
 
@@ -7,12 +11,10 @@ pub mod varint;
 // mod tests;
 // pub mod raw;
 pub mod reader;
-mod tag;
 pub mod writer;
+pub mod str;
 
-use std::{
-    any::TypeId, io::{self, ErrorKind}, mem::transmute, ops::Deref, sync::Arc
-};
+use std::io::{self, ErrorKind};
 
 // use de::DeserializeError;
 // use ser::SerializeError;
@@ -25,93 +27,6 @@ use std::{
 const MAGIC_HEADER: &[u8] = b"sd";
 
 const FORMAT_VERSION: u8 = 1;
-
-pub enum RefArcStr<'a> {
-    Arc(Arc<str>),
-    Str(&'a str),
-}
-
-impl<'a> From<&'a str> for RefArcStr<'a> {
-    fn from(value: &'a str) -> Self {
-        Self::Str(value)
-    }
-}
-
-impl From<Arc<str>> for RefArcStr<'_> {
-    fn from(value: Arc<str>) -> Self {
-        Self::Arc(value)
-    }
-}
-
-impl Deref for RefArcStr<'_> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            RefArcStr::Arc(arc) => arc.deref(),
-            RefArcStr::Str(s) => s,
-        }
-    }
-}
-
-impl<'a> From<RefArcStr<'a>> for Arc<str> {
-    fn from(val: RefArcStr<'a>) -> Self {
-        match val {
-            RefArcStr::Arc(a) => a,
-            RefArcStr::Str(s) => s.into(),
-        }
-    }
-}
-
-pub enum SdString {
-    Empty,
-    Arc(Arc<str>),
-    Owned(String),
-}
-
-impl From<Arc<str>> for SdString {
-    fn from(value: Arc<str>) -> Self {
-        Self::Arc(value)
-    }
-}
-
-impl From<String> for SdString {
-    fn from(value: String) -> Self {
-        Self::Owned(value)
-    }
-}
-
-impl Deref for SdString {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            SdString::Empty => "",
-            SdString::Arc(s) => s.deref(),
-            SdString::Owned(s) => s.deref(),
-        }
-    }
-}
-
-impl From<SdString> for Arc<str> {
-    fn from(val: SdString) -> Self {
-        match val {
-            SdString::Empty => "".into(),
-            SdString::Arc(s) => s,
-            SdString::Owned(s) => s.into(),
-        }
-    }
-}
-
-impl From<SdString> for String {
-    fn from(val: SdString) -> Self {
-        match val {
-            SdString::Empty => "".into(),
-            SdString::Arc(s) => s.deref().into(),
-            SdString::Owned(s) => s,
-        }
-    }
-}
 
 // /// Serialize data into a writer.<br>
 // /// Writer preferred to be buffered, serialization does many small writes

@@ -2,7 +2,7 @@ use std::{any::type_name, collections::BTreeMap, fmt::Debug, io, sync::Arc};
 
 use crate::{
     tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag},
-    varint, SdString,
+    varint, str::SdString,
 };
 
 pub struct Reader<R: io::Read> {
@@ -77,6 +77,9 @@ pub enum ReadError {
 
     #[error(transparent)]
     UnexpectedValueForType(#[from] UnexpectedValueForTypeError),
+    
+    #[error(transparent)]
+    UnexpectedValueForVariant(#[from] UnexpectedValueForVariantError),
 
     #[error(transparent)]
     UnexpectedValue(#[from] UnexpectedValueError),
@@ -105,6 +108,12 @@ pub enum ReadError {
         name: &'static str,
         type_name: &'static str,
     },
+
+    #[error("Unexpected enum variant name while reading {type_name}: {name}")]
+    UnexpectedEnumVariant {
+        name: Arc<str>,
+        type_name: &'static str,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +122,16 @@ pub struct UnexpectedValueForTypeError {
     expected: ValueTypeRequirement,
     found: ValueType,
     type_name: &'static str,
+}
+
+// TODO: other errors want variant name, make it into an Enum type/variant and use it instead type name in errors
+#[derive(Debug, thiserror::Error)]
+#[error("Unexpected data wile reading {type_name}::{variant_name}: Expected {expected:?}, found {found:?}")]
+pub struct UnexpectedValueForVariantError {
+    expected: ValueTypeRequirement,
+    found: ValueType,
+    type_name: &'static str,
+    variant_name: &'static str,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,11 +157,31 @@ impl UnexpectedValueError {
             type_name: name,
         }
     }
+
+    pub fn with_variant_name_of<T>(self, variant_name: &'static str) -> UnexpectedValueForVariantError {
+        UnexpectedValueForVariantError {
+            expected: self.expected,
+            found: self.found,
+            type_name: type_name::<T>(),
+            variant_name
+        }
+    }
+
+    pub fn with_variant_name(self, type_name: &'static str, variant_name: &'static str) -> UnexpectedValueForVariantError {
+        UnexpectedValueForVariantError {
+            expected: self.expected,
+            found: self.found,
+            type_name,
+            variant_name
+        }
+    }
 }
 
 pub trait UnexpectedValueResultExt<T> {
     fn with_type_name_of<U>(self) -> Result<T, UnexpectedValueForTypeError>;
     fn with_type_name(self, name: &'static str) -> Result<T, UnexpectedValueForTypeError>;
+    fn with_variant_name_of<U>(self, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError>;
+    fn with_variant_name(self, name: &'static str, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError>;
 }
 
 impl<T> UnexpectedValueResultExt<T> for Result<T, UnexpectedValueError> {
@@ -157,6 +196,19 @@ impl<T> UnexpectedValueResultExt<T> for Result<T, UnexpectedValueError> {
         match self {
             Ok(v) => Ok(v),
             Err(e) => Err(e.with_type_name(name)),
+        }
+    }
+
+    fn with_variant_name_of<U>(self, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.with_variant_name_of::<U>(variant_name))
+        }
+    }
+    fn with_variant_name(self, name: &'static str, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.with_variant_name(name, variant_name))
         }
     }
 }
@@ -460,13 +512,109 @@ pub enum StructReading<'a> {
     Struct(StructReader<'a>),
 }
 
-impl StructReading<'_> {
+impl<'a> StructReading<'a> {
     pub fn ty(&self) -> StructType {
         match self {
             Self::Unit => StructType::Unit,
             Self::Newtype(_) => StructType::Newtype,
             Self::Tuple(_) => StructType::Tuple,
             Self::Struct(_) => StructType::Struct,
+        }
+    }
+
+    /// Same as `take_unit_variant`, except gives a struct error on wrong type
+    pub fn take_unit_struct(self) -> Result<(), UnexpectedValueError> {
+        if let StructReading::Unit = self {
+            Ok(())
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Struct(Some(StructType::Unit)),
+                found: ValueType::Struct(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_newtype_variant`, except gives a struct error on wrong type
+    pub fn take_newtype_struct(self) -> Result<ValueReader<'a>, UnexpectedValueError> {
+        if let StructReading::Newtype(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Struct(Some(StructType::Newtype)),
+                found: ValueType::Struct(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_tuple_variant`, except gives a struct error on wrong type
+    pub fn take_tuple_struct(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+        if let StructReading::Tuple(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Struct(Some(StructType::Tuple)),
+                found: ValueType::Struct(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_field_variant`, except gives a struct error on wrong type
+    pub fn take_field_struct(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+        if let StructReading::Struct(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Struct(Some(StructType::Struct)),
+                found: ValueType::Struct(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_unit_struct`, except gives an enum error on wrong type
+    pub fn take_unit_variant(self) -> Result<(), UnexpectedValueError> {
+        if let StructReading::Unit = self {
+            Ok(())
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Enum(Some(StructType::Unit)),
+                found: ValueType::Enum(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_newtype_struct`, except gives an enum error on wrong type
+    pub fn take_newtype_variant(self) -> Result<ValueReader<'a>, UnexpectedValueError> {
+        if let StructReading::Newtype(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Enum(Some(StructType::Newtype)),
+                found: ValueType::Enum(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_tuple_struct`, except gives an enum error on wrong type
+    pub fn take_tuple_variant(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+        if let StructReading::Tuple(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Enum(Some(StructType::Tuple)),
+                found: ValueType::Enum(self.ty()),
+            })
+        }
+    }
+
+    /// Same as `take_field_struct`, except gives an enum error on wrong type
+    pub fn take_field_variant(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+        if let StructReading::Struct(r) = self {
+            Ok(r)
+        } else {
+            Err(UnexpectedValueError {
+                expected: ValueTypeRequirement::Enum(Some(StructType::Struct)),
+                found: ValueType::Enum(self.ty()),
+            })
         }
     }
 }
@@ -672,7 +820,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_struct(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+    pub fn take_field_struct(self) -> Result<StructReader<'a>, UnexpectedValueError> {
         if let Self::Struct(StructReading::Struct(r)) = self {
             Ok(r)
         } else {

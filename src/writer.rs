@@ -9,14 +9,12 @@ use std::{
 use crate::{
     tag::{FloatWidth, IntWidth, OptionTag, StructType, TypeTag},
     varint::{self, Sign},
-    RefArcStr,
+    str::RefArcStr,
 };
 
 const MAX_OPT_STR_LEN: usize = 255;
 
 const LEVEL_LOGGING: bool = false;
-
-// TODO: remove `&mut dyn WriterImpl`, replace with direct writer type erased reference
 
 pub struct Writer<W: io::Write> {
     writer: W,
@@ -335,7 +333,7 @@ impl<'a> ValueWriter<'a> {
     ) -> io::Result<SizedStructWriter<'a>> {
         self.writer.check_level(self.level);
         self.writer
-            .write_tag(TypeTag::EnumVariant(StructType::Tuple))?;
+            .write_tag(TypeTag::EnumVariant(StructType::Struct))?;
         self.writer.write_str(variant.into())?;
         varint::write_unsigned_varint(self.writer.inner(), fields)?;
 
@@ -579,6 +577,7 @@ impl<'a> MapPairWtiter<'a> {
             panic!("Attempt to write duplicate map key")
         }
 
+        self.key_done = true;
         let level = self.writer.new_level();
 
         ValueWriter {

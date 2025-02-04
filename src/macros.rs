@@ -1,4 +1,3 @@
-#[macro_export]
 macro_rules! define_tag {
     (@unpackarm $unpackty:ident exact $($unpack:tt)*) => {
         $unpackty::$($unpack)*
