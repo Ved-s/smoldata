@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     io,
-    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -12,13 +11,20 @@ use crate::{
     varint::{self, Sign},
 };
 
+#[cfg(smoldata_int_dev_error_checks)]
+use std::{num::NonZeroUsize, collections::BTreeSet};
+
 const MAX_OPT_STR_LEN: usize = 255;
 
 pub struct Writer<'a> {
     writer: &'a mut dyn io::Write,
     string_map: HashMap<Arc<str>, u32>,
     next_string_id: u32,
+
+    #[cfg(smoldata_int_dev_error_checks)]
     finish_parent_levels: BTreeSet<NonZeroUsize>,
+
+    #[cfg(smoldata_int_dev_error_checks)]
     level: usize,
 }
 
@@ -29,21 +35,30 @@ impl<'a> Writer<'a> {
             writer,
             string_map: Default::default(),
             next_string_id: 0,
-            level: 0,
+
+            #[cfg(smoldata_int_dev_error_checks)]
             finish_parent_levels: Default::default(),
+
+            #[cfg(smoldata_int_dev_error_checks)]
+            level: 0,
         }
     }
 
     #[track_caller]
     pub fn write(&mut self) -> ValueWriter<'_, 'a> {
-        if self.level != 0 {
-            panic!("Attempt to begin writing new root object before finishing children")
-        }
-        self.level += 1;
-        let level = NonZeroUsize::new(self.level).expect("cosmic ray");
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            if self.level != 0 {
+                panic!("Attempt to begin writing new root object before finishing children")
+            }
+            self.level += 1;
+            NonZeroUsize::new(self.level).expect("cosmic ray")
+        };
         ValueWriter {
             writer: WriterLevel {
                 writer: self,
+
+                #[cfg(smoldata_int_dev_error_checks)]
                 level: Some(level),
             },
         }
@@ -51,6 +66,7 @@ impl<'a> Writer<'a> {
 
     #[track_caller]
     pub fn finish(self) -> &'a mut dyn io::Write {
+        #[cfg(smoldata_int_dev_error_checks)]
         if self.level != 0 {
             panic!("Attempt to finish before finishing children")
         }
@@ -61,86 +77,103 @@ impl<'a> Writer<'a> {
 
 struct WriterLevel<'rf, 'wr> {
     writer: &'rf mut Writer<'wr>,
+
+    #[cfg(smoldata_int_dev_error_checks)]
     level: Option<NonZeroUsize>,
 }
 
 impl<'wr> WriterLevel<'_, 'wr> {
     #[track_caller]
     fn get(&mut self) -> WriterRef<'_, 'wr> {
+        #[cfg(smoldata_int_dev_error_checks)]
         if self.level.is_some_and(|l| l.get() < self.writer.level) {
             panic!("Attempt to use a Writer before finishing its children")
         } else if self.level.is_none_or(|l| l.get() > self.writer.level) {
             panic!("Attempt to use a Writer after it finished")
-        } else {
-            WriterRef {
-                writer: self.writer,
-            }
+        }
+        WriterRef {
+            writer: self.writer,
         }
     }
 
     #[track_caller]
     fn finish(&mut self) {
-        let level = match self.level {
-            None => panic!("Attempted to finish already finished writer"),
-            Some(l) if l.get() > self.writer.level => {
-                panic!("Attempted to finish already finished writer")
-            }
-            Some(l) => l,
-        };
-
-        if level.get() < self.writer.level {
-            self.writer.finish_parent_levels.insert(level);
-        } else {
-            self.writer.level -= 1;
-            loop {
-                let Some(level) = NonZeroUsize::new(self.writer.level) else {
-                    break;
-                };
-
-                if !self.writer.finish_parent_levels.remove(&level) {
-                    break;
+        #[cfg(smoldata_int_dev_error_checks)]
+        {
+            let level = match self.level {
+                None => panic!("Attempted to finish already finished writer"),
+                Some(l) if l.get() > self.writer.level => {
+                    panic!("Attempted to finish already finished writer")
                 }
+                Some(l) => l,
+            };
 
+            if level.get() < self.writer.level {
+                self.writer.finish_parent_levels.insert(level);
+            } else {
                 self.writer.level -= 1;
-            }
-        }
+                loop {
+                    let Some(level) = NonZeroUsize::new(self.writer.level) else {
+                        break;
+                    };
 
-        self.level = None;
+                    if !self.writer.finish_parent_levels.remove(&level) {
+                        break;
+                    }
+
+                    self.writer.level -= 1;
+                }
+            }
+
+            self.level = None;
+        }
     }
 
     /// Begin a new writer below this one
     #[track_caller]
     fn begin_sub_level(&mut self) -> WriterLevel<'_, 'wr> {
-        let level = match self.level {
-            None => panic!("Attempt to begin a new sub-writer from a finished writer"),
-            Some(l) if l.get() > self.writer.level => {
-                panic!("Attempt to begin a new sub-writer from a finished writer")
-            }
-            Some(l) => l,
-        };
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            let level = match self.level {
+                None => panic!("Attempt to begin a new sub-writer from a finished writer"),
+                Some(l) if l.get() > self.writer.level => {
+                    panic!("Attempt to begin a new sub-writer from a finished writer")
+                }
+                Some(l) => l,
+            };
 
-        self.writer.level += 1;
+            self.writer.level += 1;
+            level.checked_add(1).expect("too deep")
+        };
         WriterLevel {
             writer: self.writer,
-            level: Some(level.checked_add(1).expect("too deep")),
+
+            #[cfg(smoldata_int_dev_error_checks)]
+            level: Some(level),
         }
     }
 
     /// Finish this writer and continue current level on a new one
     #[track_caller]
     fn continue_level(&mut self) -> WriterLevel<'_, 'wr> {
-        let level = match self.level {
-            None => panic!("Attempt to continue level from a finished writer"),
-            Some(l) if l.get() > self.writer.level => {
-                panic!("Attempt to continue level from a finished writer")
-            }
-            Some(l) => l,
-        };
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            let level = match self.level {
+                None => panic!("Attempt to continue level from a finished writer"),
+                Some(l) if l.get() > self.writer.level => {
+                    panic!("Attempt to continue level from a finished writer")
+                }
+                Some(l) => l,
+            };
 
-        self.level = None;
+            self.level = None;
+            level
+        };
 
         WriterLevel {
             writer: self.writer,
+
+            #[cfg(smoldata_int_dev_error_checks)]
             level: Some(level),
         }
     }
@@ -208,7 +241,6 @@ pub struct ValueWriter<'rf, 'wr> {
 
 #[allow(unused)]
 impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
-
     #[track_caller]
     pub fn write_primitive<P: Primitive>(mut self, pri: P) -> io::Result<()> {
         let mut writer = self.writer.get();
@@ -450,7 +482,6 @@ pub struct SizedTupleWriter<'rf, 'wr> {
 }
 
 impl<'wr> SizedTupleWriter<'_, 'wr> {
-
     #[track_caller]
     pub fn write_value(&mut self) -> ValueWriter<'_, 'wr> {
         if self.remaining == 0 {
@@ -461,14 +492,11 @@ impl<'wr> SizedTupleWriter<'_, 'wr> {
 
         let writer = if self.remaining == 0 {
             self.writer.continue_level()
-        }
-        else {
+        } else {
             self.writer.begin_sub_level()
         };
 
-        ValueWriter {
-            writer
-        }
+        ValueWriter { writer }
     }
 
     pub fn remaining(&self) -> usize {
@@ -482,9 +510,11 @@ pub struct SizedStructWriter<'rf, 'wr> {
 }
 
 impl<'wr> SizedStructWriter<'_, 'wr> {
-
     #[track_caller]
-    pub fn write_field<'n>(&mut self, name: impl Into<RefArcStr<'n>>) -> io::Result<ValueWriter<'_, 'wr>> {
+    pub fn write_field<'n>(
+        &mut self,
+        name: impl Into<RefArcStr<'n>>,
+    ) -> io::Result<ValueWriter<'_, 'wr>> {
         let mut writer = self.writer.get();
         if self.remaining == 0 {
             panic!("Attempt to add more fields to the map than specified")
@@ -496,14 +526,11 @@ impl<'wr> SizedStructWriter<'_, 'wr> {
 
         let writer = if self.remaining == 0 {
             self.writer.continue_level()
-        }
-        else {
+        } else {
             self.writer.begin_sub_level()
         };
 
-        Ok(ValueWriter {
-            writer
-        })
+        Ok(ValueWriter { writer })
     }
 
     pub fn remaining(&self) -> usize {
@@ -517,7 +544,6 @@ pub struct ArrayWriter<'rf, 'wr> {
 }
 
 impl<'wr> ArrayWriter<'_, 'wr> {
-
     #[track_caller]
     pub fn write_value(&mut self) -> ValueWriter<'_, 'wr> {
         if self.remaining == Some(0) {
@@ -530,14 +556,11 @@ impl<'wr> ArrayWriter<'_, 'wr> {
 
         let writer = if self.remaining == Some(0) {
             self.writer.continue_level()
-        }
-        else {
+        } else {
             self.writer.begin_sub_level()
         };
 
-        ValueWriter {
-            writer
-        }
+        ValueWriter { writer }
     }
 
     #[track_caller]
@@ -575,8 +598,7 @@ impl<'wr> MapWriter<'_, 'wr> {
 
         let writer = if self.remaining == Some(0) {
             self.writer.continue_level()
-        }
-        else {
+        } else {
             self.writer.begin_sub_level()
         };
 
@@ -617,7 +639,7 @@ impl<'rf, 'wr> MapPairWtiter<'rf, 'wr> {
         self.key_done = true;
 
         ValueWriter {
-            writer: self.writer.begin_sub_level()
+            writer: self.writer.begin_sub_level(),
         }
     }
 
@@ -626,7 +648,7 @@ impl<'rf, 'wr> MapPairWtiter<'rf, 'wr> {
             panic!("Attempt to write map value before key")
         }
         ValueWriter {
-            writer: self.writer
+            writer: self.writer,
         }
     }
 }

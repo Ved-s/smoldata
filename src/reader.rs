@@ -1,9 +1,8 @@
 use std::{
     any::type_name,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt::Debug,
     io,
-    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -14,13 +13,19 @@ use crate::{
     varint,
 };
 
+#[cfg(smoldata_int_dev_error_checks)]
+use std::{num::NonZeroUsize, collections::BTreeSet};
+
 pub struct Reader<'a> {
     reader: &'a mut dyn io::Read,
 
     tag_peek: Option<TypeTag>,
     string_map: BTreeMap<u32, Arc<str>>,
 
+    #[cfg(smoldata_int_dev_error_checks)]
     finish_parent_levels: BTreeSet<NonZeroUsize>,
+
+    #[cfg(smoldata_int_dev_error_checks)]
     level: usize,
 }
 
@@ -31,21 +36,29 @@ impl<'a> Reader<'a> {
             tag_peek: Default::default(),
             string_map: Default::default(),
 
+            #[cfg(smoldata_int_dev_error_checks)]
             finish_parent_levels: Default::default(),
+
+            #[cfg(smoldata_int_dev_error_checks)]
             level: 0,
         }
     }
 
     #[track_caller]
     pub fn read(&mut self) -> ValueReader<'_, 'a> {
-        if self.level != 0 {
-            panic!("Attempt to begin reading new root object before finishing children")
-        }
-        self.level += 1;
-        let level = NonZeroUsize::new(self.level).expect("cosmic ray");
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            if self.level != 0 {
+                panic!("Attempt to begin reading new root object before finishing children")
+            }
+            self.level += 1;
+            NonZeroUsize::new(self.level).expect("cosmic ray")
+        };
         ValueReader {
             reader: ReaderLevel {
                 reader: self,
+
+                #[cfg(smoldata_int_dev_error_checks)]
                 level: Some(level),
             },
         }
@@ -53,6 +66,7 @@ impl<'a> Reader<'a> {
 
     #[track_caller]
     pub fn finish(self) -> &'a mut dyn io::Read {
+        #[cfg(smoldata_int_dev_error_checks)]
         if self.level != 0 {
             panic!("Attempt to finish before finishing children")
         }
@@ -63,87 +77,103 @@ impl<'a> Reader<'a> {
 
 struct ReaderLevel<'rf, 'rd> {
     pub(self) reader: &'rf mut Reader<'rd>,
+
+    #[cfg(smoldata_int_dev_error_checks)]
     pub(self) level: Option<NonZeroUsize>,
 }
 
 impl<'rd> ReaderLevel<'_, 'rd> {
-
     #[track_caller]
     fn get(&mut self) -> ReaderRef<'_, 'rd> {
+        #[cfg(smoldata_int_dev_error_checks)]
         if self.level.is_some_and(|l| l.get() < self.reader.level) {
             panic!("Attempt to use a Reader before finishing its children")
         } else if self.level.is_none_or(|l| l.get() > self.reader.level) {
             panic!("Attempt to use a Reader after it finished")
-        } else {
-            ReaderRef {
-                reader: self.reader,
-            }
+        }
+        ReaderRef {
+            reader: self.reader,
         }
     }
 
     #[track_caller]
     fn finish(&mut self) {
-        let level = match self.level {
-            None => panic!("Attempted to finish already finished reader"),
-            Some(l) if l.get() > self.reader.level => {
-                panic!("Attempted to finish already finished reader")
-            }
-            Some(l) => l,
-        };
-
-        if level.get() < self.reader.level {
-            self.reader.finish_parent_levels.insert(level);
-        } else {
-            self.reader.level -= 1;
-            loop {
-                let Some(level) = NonZeroUsize::new(self.reader.level) else {
-                    break;
-                };
-
-                if !self.reader.finish_parent_levels.remove(&level) {
-                    break;
+        #[cfg(smoldata_int_dev_error_checks)]
+        {
+            let level = match self.level {
+                None => panic!("Attempted to finish already finished reader"),
+                Some(l) if l.get() > self.reader.level => {
+                    panic!("Attempted to finish already finished reader")
                 }
+                Some(l) => l,
+            };
 
+            if level.get() < self.reader.level {
+                self.reader.finish_parent_levels.insert(level);
+            } else {
                 self.reader.level -= 1;
-            }
-        }
+                loop {
+                    let Some(level) = NonZeroUsize::new(self.reader.level) else {
+                        break;
+                    };
 
-        self.level = None;
+                    if !self.reader.finish_parent_levels.remove(&level) {
+                        break;
+                    }
+
+                    self.reader.level -= 1;
+                }
+            }
+
+            self.level = None;
+        }
     }
 
     /// Begin a new reader below this one
     #[track_caller]
     fn begin_sub_level(&mut self) -> ReaderLevel<'_, 'rd> {
-        let level = match self.level {
-            None => panic!("Attempt to begin a new sub-reader from a finished reader"),
-            Some(l) if l.get() > self.reader.level => {
-                panic!("Attempt to begin a new sub-reader from a finished reader")
-            }
-            Some(l) => l,
-        };
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            let level = match self.level {
+                None => panic!("Attempt to begin a new sub-reader from a finished reader"),
+                Some(l) if l.get() > self.reader.level => {
+                    panic!("Attempt to begin a new sub-reader from a finished reader")
+                }
+                Some(l) => l,
+            };
 
-        self.reader.level += 1;
+            self.reader.level += 1;
+            level.checked_add(1).expect("too deep")
+        };
         ReaderLevel {
             reader: self.reader,
-            level: Some(level.checked_add(1).expect("too deep")),
+
+            #[cfg(smoldata_int_dev_error_checks)]
+            level: Some(level),
         }
     }
 
     /// Finish this reader and continue current level on a new one
     #[track_caller]
     fn continue_level(&mut self) -> ReaderLevel<'_, 'rd> {
-        let level = match self.level {
-            None => panic!("Attempt to continue level from a finished reader"),
-            Some(l) if l.get() > self.reader.level => {
-                panic!("Attempt to continue level from a finished reader")
-            }
-            Some(l) => l,
-        };
+        #[cfg(smoldata_int_dev_error_checks)]
+        let level = {
+            let level = match self.level {
+                None => panic!("Attempt to continue level from a finished reader"),
+                Some(l) if l.get() > self.reader.level => {
+                    panic!("Attempt to continue level from a finished reader")
+                }
+                Some(l) => l,
+            };
 
-        self.level = None;
+            self.level = None;
+            level
+        };
 
         ReaderLevel {
             reader: self.reader,
+
+            #[cfg(smoldata_int_dev_error_checks)]
             level: Some(level),
         }
     }
@@ -211,7 +241,7 @@ impl<'rd> ReaderRef<'_, 'rd> {
 
     fn clone(&mut self) -> ReaderRef<'_, 'rd> {
         ReaderRef {
-            reader: self.reader
+            reader: self.reader,
         }
     }
 }
@@ -673,7 +703,6 @@ pub struct TupleReader<'rf, 'rd> {
 }
 
 impl<'rd> TupleReader<'_, 'rd> {
-
     #[track_caller]
     pub fn read_value(&mut self) -> Option<ValueReader<'_, 'rd>> {
         if self.remaining == 0 {
@@ -688,9 +717,7 @@ impl<'rd> TupleReader<'_, 'rd> {
             self.reader.begin_sub_level()
         };
 
-        Some(ValueReader {
-            reader: sub,
-        })
+        Some(ValueReader { reader: sub })
     }
 
     pub fn remaining(&self) -> usize {
@@ -704,7 +731,6 @@ pub struct StructReader<'rf, 'rd> {
 }
 
 impl<'rd> StructReader<'_, 'rd> {
-
     #[track_caller]
     pub fn read_field(&mut self) -> ReadResult<Option<(Arc<str>, ValueReader<'_, 'rd>)>> {
         if self.remaining == 0 {
@@ -722,9 +748,7 @@ impl<'rd> StructReader<'_, 'rd> {
             self.reader.begin_sub_level()
         };
 
-        let reader = ValueReader {
-            reader: sub,
-        };
+        let reader = ValueReader { reader: sub };
 
         Ok(Some((str, reader)))
     }
@@ -854,7 +878,6 @@ pub struct EnumReading<'rf, 'rd> {
 }
 
 impl<'rf, 'rd> EnumReading<'rf, 'rd> {
-
     #[track_caller]
     pub fn read_variant(mut self) -> ReadResult<(Arc<str>, StructReading<'rf, 'rd>)> {
         let mut reader = self.reader.get();
@@ -864,7 +887,7 @@ impl<'rf, 'rd> EnumReading<'rf, 'rd> {
             StructType::Unit => {
                 self.reader.finish();
                 StructReading::Unit
-            },
+            }
             StructType::Newtype => StructReading::Newtype(ValueReader {
                 reader: self.reader,
             }),
@@ -1125,7 +1148,6 @@ pub struct ArrayReader<'rf, 'rd> {
 }
 
 impl<'rd> ArrayReader<'_, 'rd> {
-
     #[track_caller]
     pub fn read_value(&mut self) -> ReadResult<Option<ValueReader<'_, 'rd>>> {
         if self.remaining == Some(0) {
@@ -1150,9 +1172,7 @@ impl<'rd> ArrayReader<'_, 'rd> {
             self.reader.begin_sub_level()
         };
 
-        Ok(Some(ValueReader {
-            reader: sub,
-        }))
+        Ok(Some(ValueReader { reader: sub }))
     }
 
     pub fn remaining(&self) -> Option<usize> {
@@ -1166,7 +1186,6 @@ pub struct MapReader<'rf, 'rd> {
 }
 
 impl<'rd> MapReader<'_, 'rd> {
-
     #[track_caller]
     pub fn read_pair(&mut self) -> ReadResult<Option<MapPairReader<'_, 'rd>>> {
         if self.remaining == Some(0) {
@@ -1208,7 +1227,6 @@ pub struct MapPairReader<'rf, 'rd> {
 }
 
 impl<'rf, 'rd> MapPairReader<'rf, 'rd> {
-
     #[track_caller]
     pub fn read_key(&mut self) -> ValueReader<'_, 'rd> {
         if self.key_done {
@@ -1234,7 +1252,6 @@ impl<'rf, 'rd> MapPairReader<'rf, 'rd> {
 }
 
 impl<'rf, 'rd> ValueReader<'rf, 'rd> {
-
     #[track_caller]
     pub fn read(mut self) -> ReadResult<ValueReading<'rf, 'rd>> {
         let mut reader = self.reader.get();
@@ -1242,11 +1259,11 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
             TypeTag::Unit => {
                 self.reader.finish();
                 ValueReading::Primitive(Primitive::Unit)
-            },
+            }
             TypeTag::Bool(b) => {
                 self.reader.finish();
                 ValueReading::Primitive(Primitive::Bool(b))
-            },
+            }
             TypeTag::Integer {
                 width,
                 signed,
@@ -1255,7 +1272,7 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
                 let v = Self::read_integer(reader, width, signed, varint)?;
                 self.reader.finish();
                 ValueReading::Primitive(v)
-            },
+            }
             TypeTag::Char { varint: true } => {
                 let val =
                     varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
@@ -1312,12 +1329,12 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
             TypeTag::Option(OptionTag::None) => {
                 self.reader.finish();
                 ValueReading::Option(None)
-            },
+            }
             TypeTag::Option(OptionTag::Some) => ValueReading::Option(Some(self)),
             TypeTag::Struct(StructType::Unit) => {
                 self.reader.finish();
                 ValueReading::Struct(StructReading::Unit)
-            },
+            }
             TypeTag::Struct(StructType::Newtype) => {
                 ValueReading::Struct(StructReading::Newtype(ValueReader {
                     reader: self.reader,
@@ -1366,9 +1383,9 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
             TypeTag::Tuple => {
                 let length =
                     varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                    if length == 0 {
-                        self.reader.finish();
-                    }
+                if length == 0 {
+                    self.reader.finish();
+                }
                 ValueReading::Tuple(TupleReader {
                     reader: self.reader,
                     remaining: length,
@@ -1392,7 +1409,12 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
         })
     }
 
-    fn read_integer(mut reader: ReaderRef, width: IntWidth, signed: bool, varint: bool) -> ReadResult<Primitive> {
+    fn read_integer(
+        mut reader: ReaderRef,
+        width: IntWidth,
+        signed: bool,
+        varint: bool,
+    ) -> ReadResult<Primitive> {
         // Short but very cryptic macro lol
         macro_rules! integer_read {
             (

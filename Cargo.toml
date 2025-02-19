@@ -9,3 +9,11 @@ thiserror = "1.0.63"
 
 [dev-dependencies]
 serde = { version = "*", features = ["derive"] }
+
+[features]
+default = [
+    "no_dev_error_checks_on_release"
+]
+
+no_dev_error_checks_on_release = []
+no_dev_error_checks = []
