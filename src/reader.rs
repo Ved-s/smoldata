@@ -1,47 +1,233 @@
-use std::{any::type_name, collections::BTreeMap, fmt::Debug, io, sync::Arc};
-
-use crate::{
-    tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag},
-    varint, str::SdString,
+use std::{
+    any::type_name,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    io,
+    num::NonZeroUsize,
+    ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
-pub struct Reader<R: io::Read> {
-    reader: R,
-    data: ReaderData,
+use crate::{
+    str::SdString,
+    tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag},
+    varint,
+};
+
+pub struct Reader<'a> {
+    reader: &'a mut dyn io::Read,
+
+    tag_peek: Option<TypeTag>,
+    string_map: BTreeMap<u32, Arc<str>>,
+
+    finish_parent_levels: BTreeSet<NonZeroUsize>,
+    level: usize,
 }
 
-impl<R: io::Read> Reader<R> {
-    pub fn new(reader: R) -> Self {
+impl<'a> Reader<'a> {
+    pub fn new(reader: &'a mut dyn io::Read) -> Self {
         Self {
             reader,
-            data: ReaderData {
-                tag_peek: None,
-                string_map: Default::default(),
+            tag_peek: Default::default(),
+            string_map: Default::default(),
+
+            finish_parent_levels: Default::default(),
+            level: 0,
+        }
+    }
+
+    #[track_caller]
+    pub fn read(&mut self) -> ValueReader<'_, 'a> {
+        if self.level != 0 {
+            panic!("Attempt to begin reading new root object before finishing children")
+        }
+        self.level += 1;
+        let level = NonZeroUsize::new(self.level).expect("cosmic ray");
+        ValueReader {
+            reader: ReaderLevel {
+                reader: self,
+                level: Some(level),
             },
         }
     }
 
-    fn ctx(&mut self) -> ReaderContext {
-        ReaderContext {
-            reader: &mut self.reader,
-            data: &mut self.data,
+    #[track_caller]
+    pub fn finish(self) -> &'a mut dyn io::Read {
+        if self.level != 0 {
+            panic!("Attempt to finish before finishing children")
+        }
+
+        self.reader
+    }
+}
+
+struct ReaderLevel<'rf, 'rd> {
+    pub(self) reader: &'rf mut Reader<'rd>,
+    pub(self) level: Option<NonZeroUsize>,
+}
+
+impl<'rd> ReaderLevel<'_, 'rd> {
+
+    #[track_caller]
+    fn get(&mut self) -> ReaderRef<'_, 'rd> {
+        if self.level.is_some_and(|l| l.get() < self.reader.level) {
+            panic!("Attempt to use a Reader before finishing its children")
+        } else if self.level.is_none_or(|l| l.get() > self.reader.level) {
+            panic!("Attempt to use a Reader after it finished")
+        } else {
+            ReaderRef {
+                reader: self.reader,
+            }
         }
     }
 
-    pub fn read(&mut self) -> ValueReader {
-        let ctx = self.ctx();
-        ValueReader { reader: ctx }
+    #[track_caller]
+    fn finish(&mut self) {
+        let level = match self.level {
+            None => panic!("Attempted to finish already finished reader"),
+            Some(l) if l.get() > self.reader.level => {
+                panic!("Attempted to finish already finished reader")
+            }
+            Some(l) => l,
+        };
+
+        if level.get() < self.reader.level {
+            self.reader.finish_parent_levels.insert(level);
+        } else {
+            self.reader.level -= 1;
+            loop {
+                let Some(level) = NonZeroUsize::new(self.reader.level) else {
+                    break;
+                };
+
+                if !self.reader.finish_parent_levels.remove(&level) {
+                    break;
+                }
+
+                self.reader.level -= 1;
+            }
+        }
+
+        self.level = None;
+    }
+
+    /// Begin a new reader below this one
+    #[track_caller]
+    fn begin_sub_level(&mut self) -> ReaderLevel<'_, 'rd> {
+        let level = match self.level {
+            None => panic!("Attempt to begin a new sub-reader from a finished reader"),
+            Some(l) if l.get() > self.reader.level => {
+                panic!("Attempt to begin a new sub-reader from a finished reader")
+            }
+            Some(l) => l,
+        };
+
+        self.reader.level += 1;
+        ReaderLevel {
+            reader: self.reader,
+            level: Some(level.checked_add(1).expect("too deep")),
+        }
+    }
+
+    /// Finish this reader and continue current level on a new one
+    #[track_caller]
+    fn continue_level(&mut self) -> ReaderLevel<'_, 'rd> {
+        let level = match self.level {
+            None => panic!("Attempt to continue level from a finished reader"),
+            Some(l) if l.get() > self.reader.level => {
+                panic!("Attempt to continue level from a finished reader")
+            }
+            Some(l) => l,
+        };
+
+        self.level = None;
+
+        ReaderLevel {
+            reader: self.reader,
+            level: Some(level),
+        }
     }
 }
 
-struct ReaderData {
-    tag_peek: Option<TypeTag>,
-    string_map: BTreeMap<u32, Arc<str>>,
+struct ReaderRef<'rf, 'rd> {
+    pub(self) reader: &'rf mut Reader<'rd>,
 }
 
-struct ReaderContext<'a> {
-    reader: &'a mut dyn io::Read,
-    data: &'a mut ReaderData,
+#[allow(unused)]
+impl<'rd> ReaderRef<'_, 'rd> {
+    fn read_tag(&mut self) -> ReadResult<TypeTag> {
+        if let Some(tag) = self.reader.tag_peek.take() {
+            return Ok(tag);
+        }
+
+        let tag = TypeTag::read(&mut self.reader.reader).map_err(ReadError::from)?;
+        Ok(tag)
+    }
+
+    fn peek_tag(&mut self) -> ReadResult<TypeTag> {
+        if let Some(tag) = self.reader.tag_peek {
+            return Ok(tag);
+        }
+
+        let tag = TypeTag::read(&mut self.reader.reader).map_err(ReadError::from)?;
+        self.reader.tag_peek = Some(tag);
+        Ok(tag)
+    }
+
+    fn read_str(&mut self) -> ReadResult<Arc<str>> {
+        let (index, sign) =
+            varint::read_varint_with_sign(&mut *self.reader.reader).map_err(ReadError::from)?;
+
+        Ok(match sign {
+            varint::Sign::Positive => {
+                let Some(str) = self.reader.string_map.get(&index) else {
+                    return Err(Box::new(ReadError::InvalidStringReference(index)));
+                };
+
+                str.clone()
+            }
+            varint::Sign::Negative => {
+                let length = varint::read_unsigned_varint(&mut *self.reader.reader)
+                    .map_err(ReadError::from)?;
+                let mut data = vec![0u8; length];
+                self.reader
+                    .reader
+                    .read_exact(&mut data)
+                    .map_err(ReadError::from)?;
+
+                let str = String::from_utf8(data).map_err(|_| ReadError::InvalidString)?;
+                let arc: Arc<str> = str.into();
+
+                self.reader.string_map.insert(index, arc.clone());
+
+                arc
+            }
+        })
+    }
+
+    fn inner(&mut self) -> &mut dyn io::Read {
+        &mut self.reader.reader
+    }
+
+    fn clone(&mut self) -> ReaderRef<'_, 'rd> {
+        ReaderRef {
+            reader: self.reader
+        }
+    }
+}
+
+impl DerefMut for ReaderRef<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.reader.reader
+    }
+}
+
+impl<'rd> Deref for ReaderRef<'_, 'rd> {
+    type Target = dyn io::Read + 'rd;
+
+    fn deref(&self) -> &Self::Target {
+        self.reader.reader
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,14 +263,16 @@ pub enum ReadError {
 
     #[error(transparent)]
     UnexpectedValueForType(#[from] UnexpectedValueForTypeError),
-    
+
     #[error(transparent)]
     UnexpectedValueForVariant(#[from] UnexpectedValueForVariantError),
 
     #[error(transparent)]
     UnexpectedValue(#[from] UnexpectedValueError),
 
-    #[error("Unexpected length while reading {type_name}: Expected {expected} elements, got {got}")]
+    #[error(
+        "Unexpected length while reading {type_name}: Expected {expected} elements, got {got}"
+    )]
     UnexpectedLength {
         expected: usize,
         got: usize,
@@ -158,21 +346,28 @@ impl UnexpectedValueError {
         }
     }
 
-    pub fn with_variant_name_of<T>(self, variant_name: &'static str) -> UnexpectedValueForVariantError {
+    pub fn with_variant_name_of<T>(
+        self,
+        variant_name: &'static str,
+    ) -> UnexpectedValueForVariantError {
         UnexpectedValueForVariantError {
             expected: self.expected,
             found: self.found,
             type_name: type_name::<T>(),
-            variant_name
+            variant_name,
         }
     }
 
-    pub fn with_variant_name(self, type_name: &'static str, variant_name: &'static str) -> UnexpectedValueForVariantError {
+    pub fn with_variant_name(
+        self,
+        type_name: &'static str,
+        variant_name: &'static str,
+    ) -> UnexpectedValueForVariantError {
         UnexpectedValueForVariantError {
             expected: self.expected,
             found: self.found,
             type_name,
-            variant_name
+            variant_name,
         }
     }
 }
@@ -180,8 +375,15 @@ impl UnexpectedValueError {
 pub trait UnexpectedValueResultExt<T> {
     fn with_type_name_of<U>(self) -> Result<T, UnexpectedValueForTypeError>;
     fn with_type_name(self, name: &'static str) -> Result<T, UnexpectedValueForTypeError>;
-    fn with_variant_name_of<U>(self, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError>;
-    fn with_variant_name(self, name: &'static str, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError>;
+    fn with_variant_name_of<U>(
+        self,
+        variant_name: &'static str,
+    ) -> Result<T, UnexpectedValueForVariantError>;
+    fn with_variant_name(
+        self,
+        name: &'static str,
+        variant_name: &'static str,
+    ) -> Result<T, UnexpectedValueForVariantError>;
 }
 
 impl<T> UnexpectedValueResultExt<T> for Result<T, UnexpectedValueError> {
@@ -199,84 +401,75 @@ impl<T> UnexpectedValueResultExt<T> for Result<T, UnexpectedValueError> {
         }
     }
 
-    fn with_variant_name_of<U>(self, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError> {
+    fn with_variant_name_of<U>(
+        self,
+        variant_name: &'static str,
+    ) -> Result<T, UnexpectedValueForVariantError> {
         match self {
             Ok(v) => Ok(v),
-            Err(e) => Err(e.with_variant_name_of::<U>(variant_name))
+            Err(e) => Err(e.with_variant_name_of::<U>(variant_name)),
         }
     }
-    fn with_variant_name(self, name: &'static str, variant_name: &'static str) -> Result<T, UnexpectedValueForVariantError> {
+    fn with_variant_name(
+        self,
+        name: &'static str,
+        variant_name: &'static str,
+    ) -> Result<T, UnexpectedValueForVariantError> {
         match self {
             Ok(v) => Ok(v),
-            Err(e) => Err(e.with_variant_name(name, variant_name))
+            Err(e) => Err(e.with_variant_name(name, variant_name)),
         }
     }
 }
 
 pub type ReadResult<T> = Result<T, Box<ReadError>>;
 
-impl ReaderContext<'_> {
-    fn read_tag(&mut self) -> ReadResult<TypeTag> {
-        if let Some(tag) = self.data.tag_peek.take() {
-            return Ok(tag);
-        }
+pub struct ValueReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
+}
 
-        let tag = TypeTag::read(self.reader).map_err(ReadError::from)?;
-        Ok(tag)
+#[repr(Rust, packed)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PackedU128(pub u128);
+
+impl From<u128> for PackedU128 {
+    fn from(value: u128) -> Self {
+        Self(value)
     }
-
-    fn peek_tag(&mut self) -> ReadResult<TypeTag> {
-        if let Some(tag) = self.data.tag_peek {
-            return Ok(tag);
-        }
-
-        let tag = TypeTag::read(self.reader).map_err(ReadError::from)?;
-        self.data.tag_peek = Some(tag);
-        Ok(tag)
-    }
-
-    fn inner(&mut self) -> &mut dyn io::Read {
-        self.reader
-    }
-
-    fn read_str(&mut self) -> ReadResult<Arc<str>> {
-        let (index, sign) =
-            varint::read_varint_with_sign(&mut *self.reader).map_err(ReadError::from)?;
-
-        Ok(match sign {
-            varint::Sign::Positive => {
-                let Some(str) = self.data.string_map.get(&index) else {
-                    return Err(Box::new(ReadError::InvalidStringReference(index)));
-                };
-
-                str.clone()
-            }
-            varint::Sign::Negative => {
-                let length =
-                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
-                let mut data = vec![0u8; length];
-                self.reader.read_exact(&mut data).map_err(ReadError::from)?;
-
-                let str = String::from_utf8(data).map_err(|_| ReadError::InvalidString)?;
-                let arc: Arc<str> = str.into();
-
-                self.data.string_map.insert(index, arc.clone());
-
-                arc
-            }
-        })
-    }
-
-    fn child(&mut self) -> ReaderContext<'_> {
-        ReaderContext {
-            reader: self.reader,
-            data: self.data,
-        }
+}
+impl From<PackedU128> for u128 {
+    fn from(val: PackedU128) -> Self {
+        val.0
     }
 }
 
-pub struct ValueReader<'a> {
-    reader: ReaderContext<'a>,
+#[repr(Rust, packed)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PackedI128(pub i128);
+
+impl From<i128> for PackedI128 {
+    fn from(value: i128) -> Self {
+        Self(value)
+    }
+}
+impl From<PackedI128> for i128 {
+    fn from(val: PackedI128) -> Self {
+        val.0
+    }
+}
+
+impl Debug for PackedU128 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.0;
+        Debug::fmt(&v, f)
+    }
+}
+
+impl Debug for PackedI128 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.0;
+        Debug::fmt(&v, f)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,10 +483,10 @@ pub enum Primitive {
     I16(i16),
     U32(u32),
     I32(i32),
-    I64(i64),
     U64(u64),
-    U128(u128),
-    I128(i128),
+    I64(i64),
+    U128(PackedU128),
+    I128(PackedI128),
 
     Char(char),
     F32(f32),
@@ -343,10 +536,10 @@ macro_rules! impl_primitive_try_from {
         $(
             impl TryFrom<Primitive> for $ty {
                 type Error = UnexpectedValueError;
-            
+
                 fn try_from(value: Primitive) -> Result<Self, Self::Error> {
                     match value {
-                        Primitive::$primty(v) => Ok(v),
+                        Primitive::$primty(v) => Ok(v.into()),
                         rest => Err(UnexpectedValueError {
                             expected: ValueTypeRequirement::Primitive(Some(PrimitiveType::$primty)),
                             found: ValueType::Primitive(rest.ty()),
@@ -404,20 +597,22 @@ enum StringReaderType {
     Empty,
 }
 
-pub struct StringReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct StringReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     ty: StringReaderType,
 }
 
-impl StringReader<'_> {
+impl StringReader<'_, '_> {
+    #[track_caller]
     pub fn read(mut self) -> ReadResult<SdString> {
-        Ok(match self.ty {
-            StringReaderType::Str => SdString::Arc(self.reader.read_str()?),
+        let mut reader = self.reader.get();
+        let str = match self.ty {
+            StringReaderType::Str => SdString::Arc(reader.read_str()?),
             StringReaderType::Direct => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
                 let mut data = vec![0u8; length];
-                self.reader
+                reader
                     .inner()
                     .read_exact(&mut data)
                     .map_err(ReadError::from)?;
@@ -427,51 +622,74 @@ impl StringReader<'_> {
                 SdString::Owned(str)
             }
             StringReaderType::Empty => SdString::Empty,
-        })
+        };
+
+        self.reader.finish();
+
+        Ok(str)
     }
 }
 
-pub struct BytesReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct BytesReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
 }
 
-impl BytesReader<'_> {
+impl BytesReader<'_, '_> {
+    #[track_caller]
     pub fn read_into(mut self, buf: &mut Vec<u8>) -> ReadResult<usize> {
-        let length = varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+        let mut reader = self.reader.get();
+
+        let length = varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
 
         buf.reserve(length);
-        crate::copy::<_, _, 1024>(self.reader.inner(), buf, Some(length))
+        crate::copy::<_, _, 1024>(reader.deref_mut(), buf, Some(length))
             .map_err(ReadError::from)?;
+
+        self.reader.finish();
 
         Ok(length)
     }
 
+    #[track_caller]
     pub fn read(mut self) -> ReadResult<Vec<u8>> {
-        let length = varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+        let mut reader = self.reader.get();
+
+        let length = varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
         let mut vec = vec![0u8; length];
-        self.reader
-            .inner()
+        reader
+            .deref_mut()
             .read_exact(&mut vec)
             .map_err(ReadError::from)?;
+
+        self.reader.finish();
+
         Ok(vec)
     }
 }
 
-pub struct TupleReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct TupleReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     remaining: usize,
 }
 
-impl TupleReader<'_> {
-    pub fn read_value(&mut self) -> Option<ValueReader> {
+impl<'rd> TupleReader<'_, 'rd> {
+
+    #[track_caller]
+    pub fn read_value(&mut self) -> Option<ValueReader<'_, 'rd>> {
         if self.remaining == 0 {
             return None;
         }
 
         self.remaining -= 1;
 
+        let sub = if self.remaining == 0 {
+            self.reader.continue_level()
+        } else {
+            self.reader.begin_sub_level()
+        };
+
         Some(ValueReader {
-            reader: self.reader.child(),
+            reader: sub,
         })
     }
 
@@ -480,21 +698,32 @@ impl TupleReader<'_> {
     }
 }
 
-pub struct StructReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct StructReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     remaining: usize,
 }
 
-impl StructReader<'_> {
-    pub fn read_field(&mut self) -> ReadResult<Option<(Arc<str>, ValueReader)>> {
+impl<'rd> StructReader<'_, 'rd> {
+
+    #[track_caller]
+    pub fn read_field(&mut self) -> ReadResult<Option<(Arc<str>, ValueReader<'_, 'rd>)>> {
         if self.remaining == 0 {
             return Ok(None);
         }
 
+        let mut reader = self.reader.get();
+
         self.remaining -= 1;
-        let str = self.reader.read_str()?;
+        let str = reader.read_str()?;
+
+        let sub = if self.remaining == 0 {
+            self.reader.continue_level()
+        } else {
+            self.reader.begin_sub_level()
+        };
+
         let reader = ValueReader {
-            reader: self.reader.child(),
+            reader: sub,
         };
 
         Ok(Some((str, reader)))
@@ -505,14 +734,14 @@ impl StructReader<'_> {
     }
 }
 
-pub enum StructReading<'a> {
+pub enum StructReading<'rf, 'rd> {
     Unit,
-    Newtype(ValueReader<'a>),
-    Tuple(TupleReader<'a>),
-    Struct(StructReader<'a>),
+    Newtype(ValueReader<'rf, 'rd>),
+    Tuple(TupleReader<'rf, 'rd>),
+    Struct(StructReader<'rf, 'rd>),
 }
 
-impl<'a> StructReading<'a> {
+impl<'rf, 'rd> StructReading<'rf, 'rd> {
     pub fn ty(&self) -> StructType {
         match self {
             Self::Unit => StructType::Unit,
@@ -535,7 +764,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_newtype_variant`, except gives a struct error on wrong type
-    pub fn take_newtype_struct(self) -> Result<ValueReader<'a>, UnexpectedValueError> {
+    pub fn take_newtype_struct(self) -> Result<ValueReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Newtype(r) = self {
             Ok(r)
         } else {
@@ -547,7 +776,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_tuple_variant`, except gives a struct error on wrong type
-    pub fn take_tuple_struct(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+    pub fn take_tuple_struct(self) -> Result<TupleReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Tuple(r) = self {
             Ok(r)
         } else {
@@ -559,7 +788,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_field_variant`, except gives a struct error on wrong type
-    pub fn take_field_struct(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+    pub fn take_field_struct(self) -> Result<StructReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Struct(r) = self {
             Ok(r)
         } else {
@@ -583,7 +812,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_newtype_struct`, except gives an enum error on wrong type
-    pub fn take_newtype_variant(self) -> Result<ValueReader<'a>, UnexpectedValueError> {
+    pub fn take_newtype_variant(self) -> Result<ValueReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Newtype(r) = self {
             Ok(r)
         } else {
@@ -595,7 +824,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_tuple_struct`, except gives an enum error on wrong type
-    pub fn take_tuple_variant(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+    pub fn take_tuple_variant(self) -> Result<TupleReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Tuple(r) = self {
             Ok(r)
         } else {
@@ -607,7 +836,7 @@ impl<'a> StructReading<'a> {
     }
 
     /// Same as `take_field_struct`, except gives an enum error on wrong type
-    pub fn take_field_variant(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+    pub fn take_field_variant(self) -> Result<StructReader<'rf, 'rd>, UnexpectedValueError> {
         if let StructReading::Struct(r) = self {
             Ok(r)
         } else {
@@ -619,23 +848,33 @@ impl<'a> StructReading<'a> {
     }
 }
 
-pub struct EnumReading<'a> {
-    reader: ReaderContext<'a>,
+pub struct EnumReading<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     ty: StructType,
 }
 
-impl<'a> EnumReading<'a> {
-    pub fn read_variant(mut self) -> ReadResult<(Arc<str>, StructReading<'a>)> {
-        let name = self.reader.read_str()?;
+impl<'rf, 'rd> EnumReading<'rf, 'rd> {
+
+    #[track_caller]
+    pub fn read_variant(mut self) -> ReadResult<(Arc<str>, StructReading<'rf, 'rd>)> {
+        let mut reader = self.reader.get();
+        let name = reader.read_str()?;
 
         let reader = match self.ty {
-            StructType::Unit => StructReading::Unit,
+            StructType::Unit => {
+                self.reader.finish();
+                StructReading::Unit
+            },
             StructType::Newtype => StructReading::Newtype(ValueReader {
                 reader: self.reader,
             }),
             StructType::Tuple => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
+                if length == 0 {
+                    self.reader.finish();
+                }
+
                 StructReading::Tuple(TupleReader {
                     reader: self.reader,
                     remaining: length,
@@ -643,7 +882,11 @@ impl<'a> EnumReading<'a> {
             }
             StructType::Struct => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
+                if length == 0 {
+                    self.reader.finish();
+                }
+
                 StructReading::Struct(StructReader {
                     reader: self.reader,
                     remaining: length,
@@ -705,19 +948,19 @@ impl Debug for ValueTypeRequirement {
     }
 }
 
-pub enum ValueReading<'a> {
+pub enum ValueReading<'rf, 'rd> {
     Primitive(Primitive),
-    String(StringReader<'a>),
-    Bytes(BytesReader<'a>),
-    Option(Option<ValueReader<'a>>),
-    Struct(StructReading<'a>),
-    Enum(EnumReading<'a>),
-    Tuple(TupleReader<'a>),
-    Array(ArrayReader<'a>),
-    Map(MapReader<'a>),
+    String(StringReader<'rf, 'rd>),
+    Bytes(BytesReader<'rf, 'rd>),
+    Option(Option<ValueReader<'rf, 'rd>>),
+    Struct(StructReading<'rf, 'rd>),
+    Enum(EnumReading<'rf, 'rd>),
+    Tuple(TupleReader<'rf, 'rd>),
+    Array(ArrayReader<'rf, 'rd>),
+    Map(MapReader<'rf, 'rd>),
 }
 
-impl<'a> ValueReading<'a> {
+impl<'rf, 'rd> ValueReading<'rf, 'rd> {
     pub fn ty(&self) -> ValueType {
         match self {
             Self::Primitive(p) => ValueType::Primitive(p.ty()),
@@ -743,7 +986,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_string(self) -> Result<StringReader<'a>, UnexpectedValueError> {
+    pub fn take_string(self) -> Result<StringReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::String(r) = self {
             Ok(r)
         } else {
@@ -754,7 +997,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_bytes(self) -> Result<BytesReader<'a>, UnexpectedValueError> {
+    pub fn take_bytes(self) -> Result<BytesReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Bytes(r) = self {
             Ok(r)
         } else {
@@ -765,7 +1008,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_option(self) -> Result<Option<ValueReader<'a>>, UnexpectedValueError> {
+    pub fn take_option(self) -> Result<Option<ValueReader<'rf, 'rd>>, UnexpectedValueError> {
         if let Self::Option(r) = self {
             Ok(r)
         } else {
@@ -776,7 +1019,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_any_struct(self) -> Result<StructReading<'a>, UnexpectedValueError> {
+    pub fn take_any_struct(self) -> Result<StructReading<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Struct(r) = self {
             Ok(r)
         } else {
@@ -798,7 +1041,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_newtype_struct(self) -> Result<ValueReader<'a>, UnexpectedValueError> {
+    pub fn take_newtype_struct(self) -> Result<ValueReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Struct(StructReading::Newtype(r)) = self {
             Ok(r)
         } else {
@@ -809,7 +1052,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_tuple_struct(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+    pub fn take_tuple_struct(self) -> Result<TupleReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Struct(StructReading::Tuple(r)) = self {
             Ok(r)
         } else {
@@ -820,7 +1063,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_field_struct(self) -> Result<StructReader<'a>, UnexpectedValueError> {
+    pub fn take_field_struct(self) -> Result<StructReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Struct(StructReading::Struct(r)) = self {
             Ok(r)
         } else {
@@ -831,7 +1074,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_enum(self) -> Result<EnumReading<'a>, UnexpectedValueError> {
+    pub fn take_enum(self) -> Result<EnumReading<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Enum(r) = self {
             Ok(r)
         } else {
@@ -842,7 +1085,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_tuple(self) -> Result<TupleReader<'a>, UnexpectedValueError> {
+    pub fn take_tuple(self) -> Result<TupleReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Tuple(r) = self {
             Ok(r)
         } else {
@@ -853,7 +1096,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_array(self) -> Result<ArrayReader<'a>, UnexpectedValueError> {
+    pub fn take_array(self) -> Result<ArrayReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Array(r) = self {
             Ok(r)
         } else {
@@ -864,7 +1107,7 @@ impl<'a> ValueReading<'a> {
         }
     }
 
-    pub fn take_map(self) -> Result<MapReader<'a>, UnexpectedValueError> {
+    pub fn take_map(self) -> Result<MapReader<'rf, 'rd>, UnexpectedValueError> {
         if let Self::Map(r) = self {
             Ok(r)
         } else {
@@ -876,19 +1119,24 @@ impl<'a> ValueReading<'a> {
     }
 }
 
-pub struct ArrayReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct ArrayReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     remaining: Option<usize>,
 }
 
-impl ArrayReader<'_> {
-    pub fn read_value(&mut self) -> ReadResult<Option<ValueReader>> {
+impl<'rd> ArrayReader<'_, 'rd> {
+
+    #[track_caller]
+    pub fn read_value(&mut self) -> ReadResult<Option<ValueReader<'_, 'rd>>> {
         if self.remaining == Some(0) {
             return Ok(None);
         }
 
-        if self.remaining.is_none() && matches!(self.reader.peek_tag()?, TypeTag::End) {
+        let mut reader = self.reader.get();
+
+        if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
             self.remaining = Some(0);
+            self.reader.finish();
             return Ok(None);
         }
 
@@ -896,8 +1144,14 @@ impl ArrayReader<'_> {
             *rem -= 1;
         }
 
+        let sub = if self.remaining == Some(0) {
+            self.reader.continue_level()
+        } else {
+            self.reader.begin_sub_level()
+        };
+
         Ok(Some(ValueReader {
-            reader: self.reader.child(),
+            reader: sub,
         }))
     }
 
@@ -906,19 +1160,24 @@ impl ArrayReader<'_> {
     }
 }
 
-pub struct MapReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct MapReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     remaining: Option<usize>,
 }
 
-impl MapReader<'_> {
-    pub fn read_pair(&mut self) -> ReadResult<Option<MapPairReader>> {
+impl<'rd> MapReader<'_, 'rd> {
+
+    #[track_caller]
+    pub fn read_pair(&mut self) -> ReadResult<Option<MapPairReader<'_, 'rd>>> {
         if self.remaining == Some(0) {
             return Ok(None);
         }
 
-        if self.remaining.is_none() && matches!(self.reader.peek_tag()?, TypeTag::End) {
+        let mut reader = self.reader.get();
+
+        if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
             self.remaining = Some(0);
+            self.reader.finish();
             return Ok(None);
         }
 
@@ -926,8 +1185,14 @@ impl MapReader<'_> {
             *rem -= 1;
         }
 
+        let sub = if self.remaining == Some(0) {
+            self.reader.continue_level()
+        } else {
+            self.reader.begin_sub_level()
+        };
+
         Ok(Some(MapPairReader {
-            reader: self.reader.child(),
+            reader: sub,
             key_done: false,
         }))
     }
@@ -937,24 +1202,27 @@ impl MapReader<'_> {
     }
 }
 
-pub struct MapPairReader<'a> {
-    reader: ReaderContext<'a>,
+pub struct MapPairReader<'rf, 'rd> {
+    reader: ReaderLevel<'rf, 'rd>,
     key_done: bool,
 }
 
-impl<'a> MapPairReader<'a> {
-    pub fn read_key(&mut self) -> ValueReader {
+impl<'rf, 'rd> MapPairReader<'rf, 'rd> {
+
+    #[track_caller]
+    pub fn read_key(&mut self) -> ValueReader<'_, 'rd> {
         if self.key_done {
             panic!("Attempt to read map key multiple times")
         }
 
         self.key_done = true;
         ValueReader {
-            reader: self.reader.child(),
+            reader: self.reader.begin_sub_level(),
         }
     }
 
-    pub fn read_value(self) -> ValueReader<'a> {
+    #[track_caller]
+    pub fn read_value(self) -> ValueReader<'rf, 'rd> {
         if !self.key_done {
             panic!("Attempt to read map value before key")
         }
@@ -965,48 +1233,65 @@ impl<'a> MapPairReader<'a> {
     }
 }
 
-impl<'a> ValueReader<'a> {
-    pub fn read(mut self) -> ReadResult<ValueReading<'a>> {
-        Ok(match self.reader.read_tag()? {
-            TypeTag::Unit => ValueReading::Primitive(Primitive::Unit),
-            TypeTag::Bool(b) => ValueReading::Primitive(Primitive::Bool(b)),
+impl<'rf, 'rd> ValueReader<'rf, 'rd> {
+
+    #[track_caller]
+    pub fn read(mut self) -> ReadResult<ValueReading<'rf, 'rd>> {
+        let mut reader = self.reader.get();
+        Ok(match reader.read_tag()? {
+            TypeTag::Unit => {
+                self.reader.finish();
+                ValueReading::Primitive(Primitive::Unit)
+            },
+            TypeTag::Bool(b) => {
+                self.reader.finish();
+                ValueReading::Primitive(Primitive::Bool(b))
+            },
             TypeTag::Integer {
                 width,
                 signed,
                 varint,
-            } => ValueReading::Primitive(self.read_integer(width, signed, varint)?),
+            } => {
+                let v = Self::read_integer(reader, width, signed, varint)?;
+                self.reader.finish();
+                ValueReading::Primitive(v)
+            },
             TypeTag::Char { varint: true } => {
                 let val =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
                 let char = char::from_u32(val).ok_or(ReadError::InvalidChar(val))?;
+                self.reader.finish();
                 ValueReading::Primitive(Primitive::Char(char))
             }
             TypeTag::Char { varint: false } => {
                 let mut buf = [0u8; 4];
-                self.reader
+                reader
                     .inner()
                     .read_exact(&mut buf)
                     .map_err(ReadError::from)?;
                 let val = u32::from_le_bytes(buf);
                 let char = char::from_u32(val).ok_or(ReadError::InvalidChar(val))?;
+                self.reader.finish();
                 ValueReading::Primitive(Primitive::Char(char))
             }
             TypeTag::Float(FloatWidth::F32) => {
                 let mut buf = [0u8; 4];
-                self.reader
+                reader
                     .inner()
                     .read_exact(&mut buf)
                     .map_err(ReadError::from)?;
                 let val = f32::from_le_bytes(buf);
+                self.reader.finish();
                 ValueReading::Primitive(Primitive::F32(val))
             }
             TypeTag::Float(FloatWidth::F64) => {
                 let mut buf = [0u8; 8];
-                self.reader
+                reader
                     .inner()
                     .read_exact(&mut buf)
                     .map_err(ReadError::from)?;
                 let val = f64::from_le_bytes(buf);
+                self.reader.finish();
                 ValueReading::Primitive(Primitive::F64(val))
             }
             TypeTag::Str => ValueReading::String(StringReader {
@@ -1024,9 +1309,15 @@ impl<'a> ValueReader<'a> {
             TypeTag::Bytes => ValueReading::Bytes(BytesReader {
                 reader: self.reader,
             }),
-            TypeTag::Option(OptionTag::None) => ValueReading::Option(None),
+            TypeTag::Option(OptionTag::None) => {
+                self.reader.finish();
+                ValueReading::Option(None)
+            },
             TypeTag::Option(OptionTag::Some) => ValueReading::Option(Some(self)),
-            TypeTag::Struct(StructType::Unit) => ValueReading::Struct(StructReading::Unit),
+            TypeTag::Struct(StructType::Unit) => {
+                self.reader.finish();
+                ValueReading::Struct(StructReading::Unit)
+            },
             TypeTag::Struct(StructType::Newtype) => {
                 ValueReading::Struct(StructReading::Newtype(ValueReader {
                     reader: self.reader,
@@ -1034,7 +1325,10 @@ impl<'a> ValueReader<'a> {
             }
             TypeTag::Struct(StructType::Tuple) => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
+                if length == 0 {
+                    self.reader.finish();
+                }
                 ValueReading::Struct(StructReading::Tuple(TupleReader {
                     reader: self.reader,
                     remaining: length,
@@ -1042,7 +1336,10 @@ impl<'a> ValueReader<'a> {
             }
             TypeTag::Struct(StructType::Struct) => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
+                if length == 0 {
+                    self.reader.finish();
+                }
                 ValueReading::Struct(StructReading::Struct(StructReader {
                     reader: self.reader,
                     remaining: length,
@@ -1055,9 +1352,12 @@ impl<'a> ValueReader<'a> {
             TypeTag::Array { has_length } => {
                 let length = has_length
                     .then(|| {
-                        varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)
+                        varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)
                     })
                     .transpose()?;
+                if length == Some(0) {
+                    self.reader.finish();
+                }
                 ValueReading::Array(ArrayReader {
                     reader: self.reader,
                     remaining: length,
@@ -1065,7 +1365,10 @@ impl<'a> ValueReader<'a> {
             }
             TypeTag::Tuple => {
                 let length =
-                    varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?;
+                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
+                    if length == 0 {
+                        self.reader.finish();
+                    }
                 ValueReading::Tuple(TupleReader {
                     reader: self.reader,
                     remaining: length,
@@ -1074,9 +1377,12 @@ impl<'a> ValueReader<'a> {
             TypeTag::Map { has_length } => {
                 let length = has_length
                     .then(|| {
-                        varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)
+                        varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)
                     })
                     .transpose()?;
+                if length == Some(0) {
+                    self.reader.finish();
+                }
                 ValueReading::Map(MapReader {
                     reader: self.reader,
                     remaining: length,
@@ -1086,12 +1392,7 @@ impl<'a> ValueReader<'a> {
         })
     }
 
-    fn read_integer(
-        mut self,
-        width: IntWidth,
-        signed: bool,
-        varint: bool,
-    ) -> ReadResult<Primitive> {
+    fn read_integer(mut reader: ReaderRef, width: IntWidth, signed: bool, varint: bool) -> ReadResult<Primitive> {
         // Short but very cryptic macro lol
         macro_rules! integer_read {
             (
@@ -1103,20 +1404,20 @@ impl<'a> ValueReader<'a> {
             match ($widthparam, $signedparam, $varintparam) {
                 $(
                     (IntWidth::$widthty, true, true) => Primitive::$styprim(
-                        varint::read_signed_varint(self.reader.inner()).map_err(ReadError::from)?,
+                        varint::read_signed_varint::<$sty, _>(reader.deref_mut()).map_err(ReadError::from)?.into(),
                     ),
                     (IntWidth::$widthty, true, false) => {
                         let mut buf = [0u8; $width];
-                        self.reader.inner().read_exact(&mut buf).map_err(ReadError::from)?;
-                        Primitive::$styprim($sty::from_le_bytes(buf))
+                        reader.deref_mut().read_exact(&mut buf).map_err(ReadError::from)?;
+                        Primitive::$styprim($sty::from_le_bytes(buf).into())
                     },
                     (IntWidth::$widthty, false, true) => Primitive::$unstyprim(
-                        varint::read_unsigned_varint(self.reader.inner()).map_err(ReadError::from)?,
+                        varint::read_unsigned_varint::<$unsty, _>(reader.deref_mut()).map_err(ReadError::from)?.into(),
                     ),
                     (IntWidth::$widthty, false, false) => {
                         let mut buf = [0u8; $width];
-                        self.reader.inner().read_exact(&mut buf).map_err(ReadError::from)?;
-                        Primitive::$unstyprim($unsty::from_le_bytes(buf))
+                        reader.deref_mut().read_exact(&mut buf).map_err(ReadError::from)?;
+                        Primitive::$unstyprim($unsty::from_le_bytes(buf).into())
                     },
                 )*
             }

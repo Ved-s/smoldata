@@ -247,12 +247,6 @@ impl FloatWidth {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrNewIndex {
-    New,
-    Index,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionTag {
     None,
     Some,

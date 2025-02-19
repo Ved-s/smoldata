@@ -2,78 +2,56 @@ use std::{
     collections::{BTreeSet, HashMap},
     io,
     num::NonZeroUsize,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::Arc,
 };
 
 use crate::{
+    str::RefArcStr,
     tag::{FloatWidth, IntWidth, OptionTag, StructType, TypeTag},
     varint::{self, Sign},
-    str::RefArcStr,
 };
 
 const MAX_OPT_STR_LEN: usize = 255;
 
-const LEVEL_LOGGING: bool = false;
-
-pub struct Writer<W: io::Write> {
-    writer: W,
-    data: WriterData,
-}
-
-struct WriterData {
+pub struct Writer<'a> {
+    writer: &'a mut dyn io::Write,
     string_map: HashMap<Arc<str>, u32>,
     next_string_id: u32,
     finish_parent_levels: BTreeSet<NonZeroUsize>,
     level: usize,
 }
 
-struct WriterContext<'a> {
-    writer: &'a mut dyn io::Write,
-    data: &'a mut WriterData,
-}
-
-impl WriterContext<'_> {
-    fn child(&mut self) -> WriterContext<'_> {
-        WriterContext {
-            writer: self.writer,
-            data: self.data,
-        }
-    }
-}
-
 #[allow(unused)]
-impl<W: io::Write> Writer<W> {
-    pub fn new(writer: W) -> Self {
+impl<'a> Writer<'a> {
+    pub fn new(writer: &'a mut dyn io::Write) -> Self {
         Self {
             writer,
-            data: WriterData {
-                string_map: Default::default(),
-                next_string_id: 0,
-                level: 0,
-                finish_parent_levels: Default::default(),
+            string_map: Default::default(),
+            next_string_id: 0,
+            level: 0,
+            finish_parent_levels: Default::default(),
+        }
+    }
+
+    #[track_caller]
+    pub fn write(&mut self) -> ValueWriter<'_, 'a> {
+        if self.level != 0 {
+            panic!("Attempt to begin writing new root object before finishing children")
+        }
+        self.level += 1;
+        let level = NonZeroUsize::new(self.level).expect("cosmic ray");
+        ValueWriter {
+            writer: WriterLevel {
+                writer: self,
+                level: Some(level),
             },
         }
     }
 
-    fn ctx(&mut self) -> WriterContext<'_> {
-        WriterContext { writer: &mut self.writer, data: &mut self.data }
-    }
-
-    pub fn write(&mut self) -> ValueWriter<'_> {
-        if self.data.level != 0 {
-            panic!("Attempt to begin new root object before finishing children")
-        }
-        let mut ctx = self.ctx();
-        let level = ctx.new_level();
-        ValueWriter {
-            writer: ctx,
-            level,
-        }
-    }
-
-    pub fn finish(self) -> W {
-        if self.data.level != 0 {
+    #[track_caller]
+    pub fn finish(self) -> &'a mut dyn io::Write {
+        if self.level != 0 {
             panic!("Attempt to finish before finishing children")
         }
 
@@ -81,26 +59,118 @@ impl<W: io::Write> Writer<W> {
     }
 }
 
-impl WriterContext<'_> {
+struct WriterLevel<'rf, 'wr> {
+    writer: &'rf mut Writer<'wr>,
+    level: Option<NonZeroUsize>,
+}
+
+impl<'wr> WriterLevel<'_, 'wr> {
+    #[track_caller]
+    fn get(&mut self) -> WriterRef<'_, 'wr> {
+        if self.level.is_some_and(|l| l.get() < self.writer.level) {
+            panic!("Attempt to use a Writer before finishing its children")
+        } else if self.level.is_none_or(|l| l.get() > self.writer.level) {
+            panic!("Attempt to use a Writer after it finished")
+        } else {
+            WriterRef {
+                writer: self.writer,
+            }
+        }
+    }
+
+    #[track_caller]
+    fn finish(&mut self) {
+        let level = match self.level {
+            None => panic!("Attempted to finish already finished writer"),
+            Some(l) if l.get() > self.writer.level => {
+                panic!("Attempted to finish already finished writer")
+            }
+            Some(l) => l,
+        };
+
+        if level.get() < self.writer.level {
+            self.writer.finish_parent_levels.insert(level);
+        } else {
+            self.writer.level -= 1;
+            loop {
+                let Some(level) = NonZeroUsize::new(self.writer.level) else {
+                    break;
+                };
+
+                if !self.writer.finish_parent_levels.remove(&level) {
+                    break;
+                }
+
+                self.writer.level -= 1;
+            }
+        }
+
+        self.level = None;
+    }
+
+    /// Begin a new writer below this one
+    #[track_caller]
+    fn begin_sub_level(&mut self) -> WriterLevel<'_, 'wr> {
+        let level = match self.level {
+            None => panic!("Attempt to begin a new sub-writer from a finished writer"),
+            Some(l) if l.get() > self.writer.level => {
+                panic!("Attempt to begin a new sub-writer from a finished writer")
+            }
+            Some(l) => l,
+        };
+
+        self.writer.level += 1;
+        WriterLevel {
+            writer: self.writer,
+            level: Some(level.checked_add(1).expect("too deep")),
+        }
+    }
+
+    /// Finish this writer and continue current level on a new one
+    #[track_caller]
+    fn continue_level(&mut self) -> WriterLevel<'_, 'wr> {
+        let level = match self.level {
+            None => panic!("Attempt to continue level from a finished writer"),
+            Some(l) if l.get() > self.writer.level => {
+                panic!("Attempt to continue level from a finished writer")
+            }
+            Some(l) => l,
+        };
+
+        self.level = None;
+
+        WriterLevel {
+            writer: self.writer,
+            level: Some(level),
+        }
+    }
+}
+
+struct WriterRef<'rf, 'wr> {
+    writer: &'rf mut Writer<'wr>,
+}
+
+#[allow(unused)]
+impl<'wr> WriterRef<'_, 'wr> {
     fn write_tag(&mut self, tag: TypeTag) -> io::Result<()> {
-        tag.write(self.writer)
+        tag.write(self.deref_mut())
     }
 
     fn write_str(&mut self, str: RefArcStr) -> io::Result<()> {
-        match self.data.string_map.get(str.deref()) {
+        match self.writer.string_map.get(str.deref()) {
             Some(r) => {
-                varint::write_varint_with_sign(&mut self.writer, *r, Sign::Positive)?;
+                varint::write_varint_with_sign(&mut self.writer.writer, *r, Sign::Positive)?;
             }
             None => {
-                let index = self.data.next_string_id;
-                self.data.next_string_id += 1;
+                let index = self.writer.next_string_id;
+                self.writer.next_string_id += 1;
                 let arc: Arc<str> = str.into();
 
-                varint::write_varint_with_sign(&mut self.writer, index, Sign::Negative)?;
-                varint::write_unsigned_varint(&mut self.writer, arc.len())?;
-                self.writer.write_all(arc.as_bytes())?;
+                varint::write_varint_with_sign(&mut self.writer.writer, index, Sign::Negative)?;
+                varint::write_unsigned_varint(&mut self.writer.writer, arc.len())?;
+                self.writer.writer.write_all(arc.as_bytes())?;
 
-                self.data.string_map.insert(arc, index);
+                self.writer.string_map.insert(arc, index);
             }
         }
 
@@ -108,330 +178,296 @@ impl WriterContext<'_> {
     }
 
     fn inner(&mut self) -> &mut dyn io::Write {
-        &mut self.writer
+        &mut self.writer.writer
     }
 
-    fn new_level(&mut self) -> NonZeroUsize {
-        self.data.level += 1;
-
-        if LEVEL_LOGGING {
-            println!("Begin level {}", self.data.level);
-        }
-
-        NonZeroUsize::new(self.data.level).expect("cosmic ray")
-    }
-
-    #[allow(clippy::comparison_chain)]
-    fn check_level(&self, level: NonZeroUsize) {
-        if LEVEL_LOGGING {
-            println!("Check level {level} vs {}", self.data.level);
-        }
-
-        if level.get() < self.data.level {
-            panic!("Attemt to use a Writer before finishing its children")
-        } else if level.get() > self.data.level {
-            panic!("Attemt to use a Writer after it finished")
-        }
-    }
-
-    #[allow(clippy::comparison_chain)]
-    fn finish_level(&mut self, level: NonZeroUsize) {
-        let data = &mut *self.data;
-        let deferred = level.get() < data.level;
-
-        if LEVEL_LOGGING {
-            println!(
-                "Finish level {level} (current: {}, defer: {deferred})",
-                data.level
-            );
-        }
-
-        if deferred {
-            data.finish_parent_levels.insert(level);
-        } else if data.level > level.get() {
-            panic!("Attempted to finish at a wrong layer")
-        } else {
-            data.level -= 1;
-            loop {
-                let Some(level) = NonZeroUsize::new(data.level) else {
-                    break;
-                };
-
-                if !data.finish_parent_levels.remove(&level) {
-                    break;
-                }
-
-                if LEVEL_LOGGING {
-                    println!("Finish deferred level {}", data.level);
-                }
-
-                data.level -= 1;
-            }
+    fn clone(&mut self) -> WriterRef<'_, 'wr> {
+        WriterRef {
+            writer: self.writer,
         }
     }
 }
 
-pub struct ValueWriter<'a> {
-    writer: WriterContext<'a>,
-    level: NonZeroUsize,
+impl<'wr> Deref for WriterRef<'_, 'wr> {
+    type Target = dyn io::Write + 'wr;
+
+    fn deref(&self) -> &Self::Target {
+        self.writer.writer
+    }
+}
+
+impl DerefMut for WriterRef<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.writer.writer
+    }
+}
+
+pub struct ValueWriter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
 }
 
 #[allow(unused)]
-impl<'a> ValueWriter<'a> {
+impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
+
+    #[track_caller]
     pub fn write_primitive<P: Primitive>(mut self, pri: P) -> io::Result<()> {
-        self.writer.check_level(self.level);
-        pri.write(self.writer.child())?;
-        self.writer.finish_level(self.level);
+        let mut writer = self.writer.get();
+        pri.write(writer)?;
+        self.writer.finish();
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_string<'s>(mut self, str: impl Into<RefArcStr<'s>>) -> io::Result<()> {
-        self.writer.check_level(self.level);
+        let mut writer = self.writer.get();
         let str = str.into();
         if str.is_empty() {
-            self.writer.write_tag(TypeTag::EmptyStr)?;
+            writer.write_tag(TypeTag::EmptyStr)?;
         } else if str.len() > MAX_OPT_STR_LEN {
-            self.writer.write_tag(TypeTag::StrDirect)?;
-            varint::write_unsigned_varint(self.writer.inner(), str.len())?;
-            self.writer.inner().write_all(str.as_bytes())?;
+            writer.write_tag(TypeTag::StrDirect)?;
+            varint::write_unsigned_varint(writer.inner(), str.len())?;
+            writer.write_all(str.as_bytes())?;
         } else {
-            self.writer.write_tag(TypeTag::Str)?;
-            self.writer.write_str(str)?;
+            writer.write_tag(TypeTag::Str)?;
+            writer.write_str(str)?;
         }
 
-        self.writer.finish_level(self.level);
+        self.writer.finish();
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_bytes(mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Bytes)?;
-        varint::write_unsigned_varint(self.writer.inner(), bytes.len())?;
-        self.writer.inner().write_all(bytes)?;
-        self.writer.finish_level(self.level);
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Bytes)?;
+        varint::write_unsigned_varint(writer.inner(), bytes.len())?;
+        writer.write_all(bytes)?;
+        self.writer.finish();
 
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_none(mut self) -> io::Result<()> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Option(OptionTag::None))?;
-        self.writer.finish_level(self.level);
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Option(OptionTag::None))?;
+        self.writer.finish();
 
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_some(mut self) -> io::Result<Self> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Option(OptionTag::Some))?;
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Option(OptionTag::Some))?;
 
         /// Some() stays on the same level
         Ok(self)
     }
 
+    #[track_caller]
     pub fn write_unit_struct(mut self) -> io::Result<()> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Struct(StructType::Unit))?;
-        self.writer.finish_level(self.level);
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Struct(StructType::Unit))?;
+        self.writer.finish();
 
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_newtype_struct(mut self) -> io::Result<Self> {
-        self.writer.check_level(self.level);
-        self.writer
-            .write_tag(TypeTag::Struct(StructType::Newtype))?;
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Struct(StructType::Newtype))?;
 
         /// Newtype structs stay on the same level
         Ok(self)
     }
 
-    pub fn write_tuple_struct(mut self, fields: usize) -> io::Result<SizedTupleWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Struct(StructType::Tuple))?;
-        varint::write_unsigned_varint(self.writer.inner(), fields)?;
+    #[track_caller]
+    pub fn write_tuple_struct(mut self, fields: usize) -> io::Result<SizedTupleWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Struct(StructType::Tuple))?;
+        varint::write_unsigned_varint(writer.inner(), fields)?;
 
         if fields == 0 {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         /// Containers continue on the same level
         Ok(SizedTupleWriter {
             writer: self.writer,
             remaining: fields,
-            level: self.level,
         })
     }
 
-    pub fn write_struct(mut self, fields: usize) -> io::Result<SizedStructWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Struct(StructType::Struct))?;
-        varint::write_unsigned_varint(self.writer.inner(), fields)?;
+    #[track_caller]
+    pub fn write_struct(mut self, fields: usize) -> io::Result<SizedStructWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Struct(StructType::Struct))?;
+        varint::write_unsigned_varint(writer.inner(), fields)?;
 
         if fields == 0 {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         /// Containers continue on the same level
         Ok(SizedStructWriter {
             writer: self.writer,
             remaining: fields,
-            level: self.level,
         })
     }
 
+    #[track_caller]
     pub fn write_unit_variant<'n>(mut self, variant: impl Into<RefArcStr<'n>>) -> io::Result<()> {
-        self.writer.check_level(self.level);
-        self.writer
-            .write_tag(TypeTag::EnumVariant(StructType::Unit))?;
-        self.writer.write_str(variant.into())?;
-        self.writer.finish_level(self.level);
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::EnumVariant(StructType::Unit))?;
+        writer.write_str(variant.into())?;
+        self.writer.finish();
 
         Ok(())
     }
 
+    #[track_caller]
     pub fn write_newtype_variant<'n>(
         mut self,
         variant: impl Into<RefArcStr<'n>>,
     ) -> io::Result<Self> {
-        self.writer.check_level(self.level);
-        self.writer
-            .write_tag(TypeTag::EnumVariant(StructType::Newtype))?;
-        self.writer.write_str(variant.into())?;
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::EnumVariant(StructType::Newtype))?;
+        writer.write_str(variant.into())?;
 
         /// Newtype variants stay on the same level
         Ok(self)
     }
 
+    #[track_caller]
     pub fn write_tuple_variant<'n>(
         mut self,
         variant: impl Into<RefArcStr<'n>>,
         fields: usize,
-    ) -> io::Result<SizedTupleWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer
-            .write_tag(TypeTag::EnumVariant(StructType::Tuple))?;
-        self.writer.write_str(variant.into())?;
-        varint::write_unsigned_varint(self.writer.inner(), fields)?;
+    ) -> io::Result<SizedTupleWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::EnumVariant(StructType::Tuple))?;
+        writer.write_str(variant.into())?;
+        varint::write_unsigned_varint(writer.inner(), fields)?;
 
         if fields == 0 {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         /// Containers stay on the same level
         Ok(SizedTupleWriter {
             writer: self.writer,
-            level: self.level,
             remaining: fields,
         })
     }
 
+    #[track_caller]
     pub fn write_struct_variant<'n>(
         mut self,
         variant: impl Into<RefArcStr<'n>>,
         fields: usize,
-    ) -> io::Result<SizedStructWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer
-            .write_tag(TypeTag::EnumVariant(StructType::Struct))?;
-        self.writer.write_str(variant.into())?;
-        varint::write_unsigned_varint(self.writer.inner(), fields)?;
+    ) -> io::Result<SizedStructWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::EnumVariant(StructType::Struct))?;
+        writer.write_str(variant.into())?;
+        varint::write_unsigned_varint(writer.inner(), fields)?;
 
         if fields == 0 {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         /// Containers stay on the same level
         Ok(SizedStructWriter {
             writer: self.writer,
-            level: self.level,
             remaining: fields,
         })
     }
 
-    pub fn write_tuple(mut self, fields: usize) -> io::Result<SizedTupleWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Tuple)?;
-        varint::write_unsigned_varint(self.writer.inner(), fields)?;
+    #[track_caller]
+    pub fn write_tuple(mut self, fields: usize) -> io::Result<SizedTupleWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Tuple)?;
+        varint::write_unsigned_varint(writer.inner(), fields)?;
 
         if fields == 0 {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         /// Containers continue on the same level
         Ok(SizedTupleWriter {
             writer: self.writer,
             remaining: fields,
-            level: self.level,
         })
     }
 
-    pub fn write_seq(mut self, len: Option<usize>) -> io::Result<ArrayWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Array {
+    #[track_caller]
+    pub fn write_seq(mut self, len: Option<usize>) -> io::Result<ArrayWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Array {
             has_length: len.is_some(),
         })?;
 
         if let Some(len) = len {
-            varint::write_unsigned_varint(self.writer.inner(), len)?;
+            varint::write_unsigned_varint(writer.inner(), len)?;
         }
 
         if len == Some(0) {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         Ok(ArrayWriter {
             writer: self.writer,
-            level: self.level,
             remaining: len,
         })
     }
 
-    pub fn write_map(mut self, len: Option<usize>) -> io::Result<MapWriter<'a>> {
-        self.writer.check_level(self.level);
-        self.writer.write_tag(TypeTag::Map {
+    #[track_caller]
+    pub fn write_map(mut self, len: Option<usize>) -> io::Result<MapWriter<'rf, 'wr>> {
+        let mut writer = self.writer.get();
+        writer.write_tag(TypeTag::Map {
             has_length: len.is_some(),
         })?;
 
         if let Some(len) = len {
-            varint::write_unsigned_varint(self.writer.inner(), len)?;
+            varint::write_unsigned_varint(writer.inner(), len)?;
         }
 
         if len == Some(0) {
-            self.writer.finish_level(self.level);
+            self.writer.finish();
         }
 
         Ok(MapWriter {
             writer: self.writer,
-            level: self.level,
             remaining: len,
         })
     }
 }
 
-pub struct SizedTupleWriter<'a> {
-    writer: WriterContext<'a>,
+pub struct SizedTupleWriter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
     remaining: usize,
-    level: NonZeroUsize,
 }
 
-impl SizedTupleWriter<'_> {
-    pub fn write_value(&mut self) -> ValueWriter<'_> {
-        self.writer.check_level(self.level);
+impl<'wr> SizedTupleWriter<'_, 'wr> {
+
+    #[track_caller]
+    pub fn write_value(&mut self) -> ValueWriter<'_, 'wr> {
         if self.remaining == 0 {
             panic!("Attempt to add more values to the tuple than specified")
         }
 
         self.remaining -= 1;
 
-        let level = self.writer.new_level();
-        if self.remaining == 0 {
-            self.writer.finish_level(self.level);
+        let writer = if self.remaining == 0 {
+            self.writer.continue_level()
         }
+        else {
+            self.writer.begin_sub_level()
+        };
 
         ValueWriter {
-            writer: self.writer.child(),
-            level,
+            writer
         }
     }
 
@@ -440,31 +476,33 @@ impl SizedTupleWriter<'_> {
     }
 }
 
-pub struct SizedStructWriter<'a> {
-    writer: WriterContext<'a>,
+pub struct SizedStructWriter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
     remaining: usize,
-    level: NonZeroUsize,
 }
 
-impl SizedStructWriter<'_> {
-    pub fn write_field<'n>(&mut self, name: impl Into<RefArcStr<'n>>) -> io::Result<ValueWriter> {
-        self.writer.check_level(self.level);
+impl<'wr> SizedStructWriter<'_, 'wr> {
+
+    #[track_caller]
+    pub fn write_field<'n>(&mut self, name: impl Into<RefArcStr<'n>>) -> io::Result<ValueWriter<'_, 'wr>> {
+        let mut writer = self.writer.get();
         if self.remaining == 0 {
             panic!("Attempt to add more fields to the map than specified")
         }
 
         self.remaining -= 1;
 
-        self.writer.write_str(name.into())?;
+        writer.write_str(name.into())?;
 
-        let level = self.writer.new_level();
-        if self.remaining == 0 {
-            self.writer.finish_level(self.level);
+        let writer = if self.remaining == 0 {
+            self.writer.continue_level()
         }
+        else {
+            self.writer.begin_sub_level()
+        };
 
         Ok(ValueWriter {
-            writer: self.writer.child(),
-            level,
+            writer
         })
     }
 
@@ -473,15 +511,15 @@ impl SizedStructWriter<'_> {
     }
 }
 
-pub struct ArrayWriter<'a> {
-    writer: WriterContext<'a>,
+pub struct ArrayWriter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
     remaining: Option<usize>,
-    level: NonZeroUsize,
 }
 
-impl ArrayWriter<'_> {
-    pub fn write_value(&mut self) -> ValueWriter {
-        self.writer.check_level(self.level);
+impl<'wr> ArrayWriter<'_, 'wr> {
+
+    #[track_caller]
+    pub fn write_value(&mut self) -> ValueWriter<'_, 'wr> {
         if self.remaining == Some(0) {
             panic!("Attempt to add more values to the seq than specified")
         }
@@ -490,24 +528,26 @@ impl ArrayWriter<'_> {
             *remaining -= 1;
         }
 
-        let level = self.writer.new_level();
-        if self.remaining == Some(0) {
-            self.writer.finish_level(self.level);
+        let writer = if self.remaining == Some(0) {
+            self.writer.continue_level()
         }
+        else {
+            self.writer.begin_sub_level()
+        };
 
         ValueWriter {
-            writer: self.writer.child(),
-            level,
+            writer
         }
     }
 
+    #[track_caller]
     pub fn finish(mut self) -> io::Result<()> {
         match self.remaining {
             Some(0) => Ok(()),
             Some(_) => panic!("Attempt to finish before adding all specified values"),
             None => {
-                self.writer.write_tag(TypeTag::End)?;
-                self.writer.finish_level(self.level);
+                self.writer.get().write_tag(TypeTag::End)?;
+                self.writer.finish();
                 Ok(())
             }
         }
@@ -518,15 +558,13 @@ impl ArrayWriter<'_> {
     }
 }
 
-pub struct MapWriter<'a> {
-    writer: WriterContext<'a>,
+pub struct MapWriter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
     remaining: Option<usize>,
-    level: NonZeroUsize,
 }
 
-impl MapWriter<'_> {
-    pub fn write_pair(&mut self) -> MapPairWtiter {
-        self.writer.check_level(self.level);
+impl<'wr> MapWriter<'_, 'wr> {
+    pub fn write_pair(&mut self) -> MapPairWtiter<'_, 'wr> {
         if self.remaining == Some(0) {
             panic!("Attempt to add more values to the seq than specified")
         }
@@ -535,15 +573,16 @@ impl MapWriter<'_> {
             *remaining -= 1;
         }
 
-        let level = self.writer.new_level();
-        if self.remaining == Some(0) {
-            self.writer.finish_level(self.level);
+        let writer = if self.remaining == Some(0) {
+            self.writer.continue_level()
         }
+        else {
+            self.writer.begin_sub_level()
+        };
 
         MapPairWtiter {
-            writer: self.writer.child(),
+            writer,
             key_done: false,
-            level,
         }
     }
 
@@ -552,8 +591,8 @@ impl MapWriter<'_> {
             Some(0) => Ok(()),
             Some(_) => panic!("Attempt to finish before adding all specified values"),
             None => {
-                self.writer.write_tag(TypeTag::End)?;
-                self.writer.finish_level(self.level);
+                self.writer.get().write_tag(TypeTag::End)?;
+                self.writer.finish();
                 Ok(())
             }
         }
@@ -564,36 +603,30 @@ impl MapWriter<'_> {
     }
 }
 
-pub struct MapPairWtiter<'a> {
-    writer: WriterContext<'a>,
+pub struct MapPairWtiter<'rf, 'wr> {
+    writer: WriterLevel<'rf, 'wr>,
     key_done: bool,
-    level: NonZeroUsize,
 }
 
-impl<'a> MapPairWtiter<'a> {
-    pub fn write_key(&mut self) -> ValueWriter {
-        self.writer.check_level(self.level);
+impl<'rf, 'wr> MapPairWtiter<'rf, 'wr> {
+    pub fn write_key(&mut self) -> ValueWriter<'_, 'wr> {
         if self.key_done {
             panic!("Attempt to write duplicate map key")
         }
 
         self.key_done = true;
-        let level = self.writer.new_level();
 
         ValueWriter {
-            writer: self.writer.child(),
-            level,
+            writer: self.writer.begin_sub_level()
         }
     }
 
-    pub fn write_value(self) -> ValueWriter<'a> {
+    pub fn write_value(self) -> ValueWriter<'rf, 'wr> {
         if !self.key_done {
             panic!("Attempt to write map value before key")
         }
-        self.writer.check_level(self.level);
         ValueWriter {
-            writer: self.writer,
-            level: self.level,
+            writer: self.writer
         }
     }
 }
@@ -604,17 +637,17 @@ pub trait Primitive: PrimitiveImpl {}
 impl<P: PrimitiveImpl> Primitive for P {}
 
 trait PrimitiveImpl: Copy {
-    fn write(self, writer: WriterContext) -> io::Result<()>;
+    fn write(self, writer: WriterRef) -> io::Result<()>;
 }
 
 impl PrimitiveImpl for () {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Unit)
     }
 }
 
 impl PrimitiveImpl for u8 {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Integer {
             width: IntWidth::W8,
             signed: false,
@@ -626,7 +659,7 @@ impl PrimitiveImpl for u8 {
 }
 
 impl PrimitiveImpl for i8 {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Integer {
             width: IntWidth::W8,
             signed: true,
@@ -638,14 +671,14 @@ impl PrimitiveImpl for i8 {
 }
 
 impl PrimitiveImpl for bool {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Bool(self))?;
         Ok(())
     }
 }
 
 impl PrimitiveImpl for char {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         let v = self as u32;
 
         let varint = varint::is_varint_better(v.leading_zeros(), 4, true);
@@ -662,7 +695,7 @@ impl PrimitiveImpl for char {
 }
 
 impl PrimitiveImpl for f32 {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Float(FloatWidth::F32))?;
         writer.inner().write_all(&self.to_le_bytes())?;
         Ok(())
@@ -670,7 +703,7 @@ impl PrimitiveImpl for f32 {
 }
 
 impl PrimitiveImpl for f64 {
-    fn write(self, mut writer: WriterContext) -> io::Result<()> {
+    fn write(self, mut writer: WriterRef) -> io::Result<()> {
         writer.write_tag(TypeTag::Float(FloatWidth::F64))?;
         writer.inner().write_all(&self.to_le_bytes())?;
         Ok(())
@@ -692,7 +725,7 @@ macro_rules! impl_primitive {
     };
     ($ty:ident $width:literal $signed:ident $formatwidth:ident) => {
         impl PrimitiveImpl for $ty {
-            fn write(self, mut writer: WriterContext) -> io::Result<()> {
+            fn write(self, mut writer: WriterRef) -> io::Result<()> {
                 let varint = varint::is_varint_better(impl_primitive!(@leading_zeros self $signed), $width, $signed);
                 writer.write_tag(TypeTag::Integer {
                     width: IntWidth::$formatwidth,

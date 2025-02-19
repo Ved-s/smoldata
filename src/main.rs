@@ -42,19 +42,22 @@ fn main() {
 
     println!("write: {data:?}");
 
-    let mut writer = Writer::new(vec![]);
+    let mut vec = vec![];
+    let mut writer = Writer::new(&mut vec);
     data.write(writer.write()).unwrap();
 
-    let vec = writer.finish();
+    writer.finish();
 
     println!("written {} bytes:", vec.len());
     hexdump(&vec);
 
-    std::fs::write("sd.bin", &vec).unwrap();
+    let mut cursor = io::Cursor::new(&vec);
 
-    let mut reader = Reader::new(io::Cursor::new(&vec));
+    let mut reader = Reader::new(&mut cursor);
 
     let struc = Struct::read(reader.read()).unwrap();
+
+    reader.finish();
 
     println!("read: {struc:?}");
 }
@@ -100,15 +103,15 @@ fn hexdump(bytes: &[u8]) {
     }
 }
 
-trait SdWrite {
+trait SmolWrite {
     fn write(&self, writer: ValueWriter) -> io::Result<()>;
 }
 
-trait SdRead: Sized {
+trait SmolRead: Sized {
     fn read(reader: ValueReader) -> ReadResult<Self>;
 }
 
-impl SdWrite for Struct {
+impl SmolWrite for Struct {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         let mut struc = writer.write_struct(3)?;
 
@@ -120,7 +123,7 @@ impl SdWrite for Struct {
     }
 }
 
-impl SdWrite for Enum {
+impl SmolWrite for Enum {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         match self {
             Enum::A(v) => v.write(writer.write_newtype_variant("A")?),
@@ -141,7 +144,7 @@ impl SdWrite for Enum {
     }
 }
 
-impl SdRead for Struct {
+impl SmolRead for Struct {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let mut struc = reader
             .read()?
@@ -163,7 +166,7 @@ impl SdRead for Struct {
                         }
                         .into());
                     }
-                    f_values = Some(SdRead::read(field.1)?);
+                    f_values = Some(SmolRead::read(field.1)?);
                 }
 
                 "e" => {
@@ -174,7 +177,7 @@ impl SdRead for Struct {
                         }
                         .into());
                     }
-                    f_e = Some(SdRead::read(field.1)?);
+                    f_e = Some(SmolRead::read(field.1)?);
                 }
 
                 "tup" => {
@@ -185,7 +188,7 @@ impl SdRead for Struct {
                         }
                         .into());
                     }
-                    f_tup = Some(SdRead::read(field.1)?);
+                    f_tup = Some(SmolRead::read(field.1)?);
                 }
 
                 _ => {
@@ -221,7 +224,7 @@ impl SdRead for Struct {
     }
 }
 
-impl SdRead for Enum {
+impl SmolRead for Enum {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let var = reader
             .read()?
@@ -231,7 +234,7 @@ impl SdRead for Enum {
             .read_variant()?;
 
         Ok(match var.0.deref() {
-            "A" => Self::A(SdRead::read(
+            "A" => Self::A(SmolRead::read(
                 var.1
                     .take_newtype_variant()
                     .with_variant_name(type_name::<Enum>(), "A")
@@ -261,19 +264,19 @@ impl SdRead for Enum {
                         break 'read;
                     };
 
-                    let v1 = SdRead::read(reader)?;
+                    let v1 = SmolRead::read(reader)?;
 
                     let Some(reader) = tuple.read_value() else {
                         break 'read;
                     };
 
-                    let v2 = SdRead::read(reader)?;
+                    let v2 = SmolRead::read(reader)?;
 
                     let Some(reader) = tuple.read_value() else {
                         break 'read;
                     };
 
-                    let v3 = SdRead::read(reader)?;
+                    let v3 = SmolRead::read(reader)?;
 
                     return Ok(Self::C(v1, v2, v3));
                 }
@@ -304,7 +307,7 @@ impl SdRead for Enum {
                                 }
                                 .into());
                             }
-                            f_v = Some(SdRead::read(field.1)?);
+                            f_v = Some(SmolRead::read(field.1)?);
                         }
                         _ => {
                             return Err(ReadError::UnexpectedStructField {
@@ -334,10 +337,10 @@ impl SdRead for Enum {
     }
 }
 
-macro_rules! impl_sdwrite_primitive {
+macro_rules! impl_smolwrite_primitive {
     ($($ty:ty),* $(,)?) => {
         $(
-        impl SdWrite for $ty {
+        impl SmolWrite for $ty {
             fn write(&self, writer: ValueWriter) -> io::Result<()> {
                 writer.write_primitive(*self)
             }
@@ -345,7 +348,7 @@ macro_rules! impl_sdwrite_primitive {
     };
 }
 
-impl_sdwrite_primitive!(
+impl_smolwrite_primitive!(
     (),
     bool,
     char,
@@ -363,13 +366,13 @@ impl_sdwrite_primitive!(
     u128
 );
 
-impl SdWrite for String {
+impl SmolWrite for String {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         writer.write_string(self.deref())
     }
 }
 
-impl<T: SdWrite> SdWrite for Vec<T> {
+impl<T: SmolWrite> SmolWrite for Vec<T> {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         let mut seq = writer.write_seq(Some(self.len()))?;
         for i in self {
@@ -379,7 +382,7 @@ impl<T: SdWrite> SdWrite for Vec<T> {
     }
 }
 
-impl<T1: SdWrite, T2: SdWrite> SdWrite for (T1, T2) {
+impl<T1: SmolWrite, T2: SmolWrite> SmolWrite for (T1, T2) {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         let mut tup = writer.write_tuple(2)?;
 
@@ -390,7 +393,7 @@ impl<T1: SdWrite, T2: SdWrite> SdWrite for (T1, T2) {
     }
 }
 
-impl<K: SdWrite, V: SdWrite, S> SdWrite for HashMap<K, V, S> {
+impl<K: SmolWrite, V: SmolWrite, S> SmolWrite for HashMap<K, V, S> {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
         let mut map = writer.write_map(Some(self.len()))?;
 
@@ -405,10 +408,10 @@ impl<K: SdWrite, V: SdWrite, S> SdWrite for HashMap<K, V, S> {
     }
 }
 
-macro_rules! impl_sdread_primitive {
+macro_rules! impl_smolread_primitive {
     ($($ty:ty),* $(,)?) => {
         $(
-            impl SdRead for $ty {
+            impl SmolRead for $ty {
                 fn read(reader: ValueReader) -> ReadResult<Self> {
                     let pri = reader.read()?.take_primitive().map_err(ReadError::from)?;
                     let val = pri.try_into().with_type_name_of::<Self>().map_err(ReadError::from)?;
@@ -419,7 +422,7 @@ macro_rules! impl_sdread_primitive {
     };
 }
 
-impl_sdread_primitive!(
+impl_smolread_primitive!(
     (),
     bool,
     char,
@@ -437,7 +440,7 @@ impl_sdread_primitive!(
     u128
 );
 
-impl SdRead for String {
+impl SmolRead for String {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         Ok(reader
             .read()?
@@ -449,7 +452,7 @@ impl SdRead for String {
     }
 }
 
-impl<T: SdRead> SdRead for Vec<T> {
+impl<T: SmolRead> SmolRead for Vec<T> {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let mut array = reader
             .read()?
@@ -471,7 +474,7 @@ impl<T: SdRead> SdRead for Vec<T> {
     }
 }
 
-impl<T1: SdRead, T2: SdRead> SdRead for (T1, T2) {
+impl<T1: SmolRead, T2: SmolRead> SmolRead for (T1, T2) {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let mut tuple = reader
             .read()?
@@ -509,7 +512,7 @@ impl<T1: SdRead, T2: SdRead> SdRead for (T1, T2) {
     }
 }
 
-impl<K: SdRead + Hash + Eq, V: SdRead> SdRead for HashMap<K, V> {
+impl<K: SmolRead + Hash + Eq, V: SmolRead> SmolRead for HashMap<K, V> {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         let mut map_read = reader
             .read()?
