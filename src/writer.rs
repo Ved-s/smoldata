@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
-use std::{num::NonZeroUsize, collections::BTreeSet};
+use std::{collections::BTreeSet, num::NonZeroUsize};
 
 const MAX_OPT_STR_LEN: usize = 255;
 

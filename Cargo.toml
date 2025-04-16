@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 serde = { version = "*" }
 thiserror = "1.0.63"
+smoldata_derive = { path = "derive" }
 
 [dev-dependencies]
 serde = { version = "*", features = ["derive"] }

@@ -279,14 +279,13 @@ pub fn read_unsigned_varint_bits_le<R: io::Read>(
 }
 
 pub fn copy_varint<S: io::Read, D: io::Write>(src: &mut S, dst: &mut D) -> Result<(), io::Error> {
-
     let mut buf = [0u8; 16];
     let mut buf_len = 0;
 
     loop {
         let mut byte = 0u8;
         src.read_exact(std::slice::from_mut(&mut byte))?;
-        
+
         if buf_len >= buf.len() {
             dst.write_all(&buf[..buf_len])?;
             buf_len = 0;
@@ -306,7 +305,6 @@ pub fn copy_varint<S: io::Read, D: io::Write>(src: &mut S, dst: &mut D) -> Resul
 
     Ok(())
 }
-
 
 pub fn is_varint_better(abs_leading_zeros: u32, bytewidth: u32, signed: bool) -> bool {
     let value_width = bytewidth * 8 - abs_leading_zeros;

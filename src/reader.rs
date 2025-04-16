@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
-use std::{num::NonZeroUsize, collections::BTreeSet};
+use std::{collections::BTreeSet, num::NonZeroUsize};
 
 pub struct Reader<'a> {
     reader: &'a mut dyn io::Read,

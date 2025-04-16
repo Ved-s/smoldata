@@ -301,14 +301,13 @@ pub enum TypeTag {
     End,
 }
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum TagReadError {
     #[error(transparent)]
     IoError(#[from] io::Error),
-    
+
     #[error(transparent)]
-    InvalidTagError(#[from] InvalidTagError)
+    InvalidTagError(#[from] InvalidTagError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -322,17 +321,17 @@ impl TypeTag {
             TypeTag::Unit => &[],
             TypeTag::Bool(_) => &[],
 
-            TypeTag::Integer { width: _, signed: _, varint: true } 
+            TypeTag::Integer { width: _, signed: _, varint: true }
                 => &[TagParameter::Varint],
-            TypeTag::Integer { width: IntWidth::W8, signed: _, varint: false } 
+            TypeTag::Integer { width: IntWidth::W8, signed: _, varint: false }
                 => &[TagParameter::FixedIntBytes(IntWidth::W8)],
-            TypeTag::Integer { width: IntWidth::W16, signed: _, varint: false } 
+            TypeTag::Integer { width: IntWidth::W16, signed: _, varint: false }
                 => &[TagParameter::FixedIntBytes(IntWidth::W16)],
-            TypeTag::Integer { width: IntWidth::W32, signed: _, varint: false } 
+            TypeTag::Integer { width: IntWidth::W32, signed: _, varint: false }
                 => &[TagParameter::FixedIntBytes(IntWidth::W32)],
-            TypeTag::Integer { width: IntWidth::W64, signed: _, varint: false } 
+            TypeTag::Integer { width: IntWidth::W64, signed: _, varint: false }
                 => &[TagParameter::FixedIntBytes(IntWidth::W64)],
-            TypeTag::Integer { width: IntWidth::W128, signed: _, varint: false } 
+            TypeTag::Integer { width: IntWidth::W128, signed: _, varint: false }
                 => &[TagParameter::FixedIntBytes(IntWidth::W128)],
 
             TypeTag::Char { varint: false } => &[TagParameter::FixedIntBytes(IntWidth::W32)],
@@ -354,13 +353,13 @@ impl TypeTag {
             TypeTag::Struct(StructType::Tuple) => &[TagParameter::Varint],
             TypeTag::Struct(StructType::Struct) => &[TagParameter::Varint],
 
-            TypeTag::EnumVariant(StructType::Unit) 
+            TypeTag::EnumVariant(StructType::Unit)
                 => &[TagParameter::StringRef],
-            TypeTag::EnumVariant(StructType::Newtype) 
+            TypeTag::EnumVariant(StructType::Newtype)
                 => &[TagParameter::StringRef],
-            TypeTag::EnumVariant(StructType::Tuple) 
+            TypeTag::EnumVariant(StructType::Tuple)
                 => &[TagParameter::StringRef, TagParameter::Varint],
-            TypeTag::EnumVariant(StructType::Struct) 
+            TypeTag::EnumVariant(StructType::Struct)
                 => &[TagParameter::StringRef, TagParameter::Varint],
 
             TypeTag::Array { has_length: true } => &[TagParameter::Varint],
@@ -379,7 +378,8 @@ impl TypeTag {
     pub fn read<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, TagReadError> {
         let mut byte = 0u8;
         reader.read_exact(slice::from_mut(&mut byte))?;
-        let packed = FlatTypeTag::try_from(byte).map_err(|v| TagReadError::InvalidTagError(InvalidTagError(v)))?;
+        let packed = FlatTypeTag::try_from(byte)
+            .map_err(|v| TagReadError::InvalidTagError(InvalidTagError(v)))?;
         Ok(packed.into())
     }
 }
