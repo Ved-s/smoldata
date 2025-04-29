@@ -92,6 +92,10 @@ impl SmolWrite for RawValue {
 
         main_writer.writer.finish();
 
+        if cursor.position() != self.0.len() as u64 {
+            return Err(io::Error::new(ErrorKind::InvalidData, "RawValue contains data past its object data"));
+        }
+
         Ok(())
     }
 }
