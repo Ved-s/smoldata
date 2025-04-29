@@ -278,7 +278,7 @@ pub fn read_unsigned_varint_bits_le<R: io::Read>(
     Ok(wrote)
 }
 
-pub fn copy_varint<S: io::Read, D: io::Write>(src: &mut S, dst: &mut D) -> Result<(), io::Error> {
+pub fn copy_varint<S: io::Read + ?Sized, D: io::Write + ?Sized>(src: &mut S, dst: &mut D) -> Result<(), io::Error> {
     let mut buf = [0u8; 16];
     let mut buf_len = 0;
 

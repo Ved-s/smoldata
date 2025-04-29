@@ -4,12 +4,13 @@
 mod macros;
 mod tag;
 
-// pub mod ser;
 pub mod varint;
 
-// #[cfg(test)]
-// mod tests;
-// pub mod raw;
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "raw_value")]
+pub mod raw;
 pub mod reader;
 pub mod str;
 pub mod writer;
@@ -26,6 +27,7 @@ use reader::{ReadError, ReadResult, UnexpectedValueResultExt, ValueReader};
 use writer::ValueWriter;
 
 pub use smoldata_derive::{SmolRead, SmolReadWrite, SmolWrite};
+
 
 // use de::DeserializeError;
 // use ser::SerializeError;
@@ -125,6 +127,9 @@ pub trait SmolWrite {
 pub trait SmolRead: Sized {
     fn read(reader: ValueReader) -> ReadResult<Self>;
 }
+
+pub trait SmolReadWrite: SmolRead + SmolWrite {}
+impl<T: SmolRead + SmolWrite> SmolReadWrite for T {}
 
 macro_rules! impl_smolwrite_primitive {
     ($($ty:ty),* $(,)?) => {

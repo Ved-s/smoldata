@@ -8,9 +8,7 @@ use std::{
 };
 
 use crate::{
-    str::SdString,
-    tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag},
-    varint,
+    str::SdString, tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag}, varint
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
@@ -73,9 +71,14 @@ impl<'a> Reader<'a> {
 
         self.reader
     }
+    
+    #[allow(unused)]
+    pub(crate) fn get_ref(&mut self) -> ReaderRef<'_, 'a> {
+        ReaderRef { reader: self }
+    }
 }
 
-struct ReaderLevel<'rf, 'rd> {
+pub(crate) struct ReaderLevel<'rf, 'rd> {
     pub(self) reader: &'rf mut Reader<'rd>,
 
     #[cfg(smoldata_int_dev_error_checks)]
@@ -84,7 +87,7 @@ struct ReaderLevel<'rf, 'rd> {
 
 impl<'rd> ReaderLevel<'_, 'rd> {
     #[track_caller]
-    fn get(&mut self) -> ReaderRef<'_, 'rd> {
+    pub fn get(&mut self) -> ReaderRef<'_, 'rd> {
         #[cfg(smoldata_int_dev_error_checks)]
         if self.level.is_some_and(|l| l.get() < self.reader.level) {
             panic!("Attempt to use a Reader before finishing its children")
@@ -97,7 +100,7 @@ impl<'rd> ReaderLevel<'_, 'rd> {
     }
 
     #[track_caller]
-    fn finish(&mut self) {
+    pub fn finish(&mut self) {
         #[cfg(smoldata_int_dev_error_checks)]
         {
             let level = match self.level {
@@ -131,7 +134,7 @@ impl<'rd> ReaderLevel<'_, 'rd> {
 
     /// Begin a new reader below this one
     #[track_caller]
-    fn begin_sub_level(&mut self) -> ReaderLevel<'_, 'rd> {
+    pub fn begin_sub_level(&mut self) -> ReaderLevel<'_, 'rd> {
         #[cfg(smoldata_int_dev_error_checks)]
         let level = {
             let level = match self.level {
@@ -155,7 +158,7 @@ impl<'rd> ReaderLevel<'_, 'rd> {
 
     /// Finish this reader and continue current level on a new one
     #[track_caller]
-    fn continue_level(&mut self) -> ReaderLevel<'_, 'rd> {
+    pub fn continue_level(&mut self) -> ReaderLevel<'_, 'rd> {
         #[cfg(smoldata_int_dev_error_checks)]
         let level = {
             let level = match self.level {
@@ -179,13 +182,13 @@ impl<'rd> ReaderLevel<'_, 'rd> {
     }
 }
 
-struct ReaderRef<'rf, 'rd> {
+pub(crate) struct ReaderRef<'rf, 'rd> {
     pub(self) reader: &'rf mut Reader<'rd>,
 }
 
 #[allow(unused)]
 impl<'rd> ReaderRef<'_, 'rd> {
-    fn read_tag(&mut self) -> ReadResult<TypeTag> {
+    pub fn read_tag(&mut self) -> ReadResult<TypeTag> {
         if let Some(tag) = self.reader.tag_peek.take() {
             return Ok(tag);
         }
@@ -194,7 +197,7 @@ impl<'rd> ReaderRef<'_, 'rd> {
         Ok(tag)
     }
 
-    fn peek_tag(&mut self) -> ReadResult<TypeTag> {
+    pub fn peek_tag(&mut self) -> ReadResult<TypeTag> {
         if let Some(tag) = self.reader.tag_peek {
             return Ok(tag);
         }
@@ -204,7 +207,7 @@ impl<'rd> ReaderRef<'_, 'rd> {
         Ok(tag)
     }
 
-    fn read_str(&mut self) -> ReadResult<Arc<str>> {
+    pub fn read_str(&mut self) -> ReadResult<Arc<str>> {
         let (index, sign) =
             varint::read_varint_with_sign(&mut *self.reader.reader).map_err(ReadError::from)?;
 
@@ -235,14 +238,18 @@ impl<'rd> ReaderRef<'_, 'rd> {
         })
     }
 
-    fn inner(&mut self) -> &mut dyn io::Read {
+    pub fn inner(&mut self) -> &mut dyn io::Read {
         &mut self.reader.reader
     }
 
-    fn clone(&mut self) -> ReaderRef<'_, 'rd> {
+    pub fn clone(&mut self) -> ReaderRef<'_, 'rd> {
         ReaderRef {
             reader: self.reader,
         }
+    }
+    
+    pub fn consume_peek(&mut self) -> Option<TypeTag> {
+        self.reader.tag_peek.take()
     }
 }
 
@@ -455,7 +462,7 @@ impl<T> UnexpectedValueResultExt<T> for Result<T, UnexpectedValueError> {
 pub type ReadResult<T> = Result<T, Box<ReadError>>;
 
 pub struct ValueReader<'rf, 'rd> {
-    reader: ReaderLevel<'rf, 'rd>,
+    pub(crate) reader: ReaderLevel<'rf, 'rd>,
 }
 
 #[repr(Rust, packed)]
@@ -1157,6 +1164,7 @@ impl<'rd> ArrayReader<'_, 'rd> {
         let mut reader = self.reader.get();
 
         if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
+            reader.read_tag()?;
             self.remaining = Some(0);
             self.reader.finish();
             return Ok(None);
@@ -1195,6 +1203,7 @@ impl<'rd> MapReader<'_, 'rd> {
         let mut reader = self.reader.get();
 
         if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
+            reader.read_tag()?;
             self.remaining = Some(0);
             self.reader.finish();
             return Ok(None);

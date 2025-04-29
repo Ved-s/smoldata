@@ -1,317 +1,19 @@
 use std::{
-    fmt, io::{self, Read, Write}, marker::PhantomData, ops::Deref
+    fmt,
+    io::{self, ErrorKind},
 };
-
-use serde::{de::{DeserializeOwned, Visitor}, Deserialize, Serialize};
 
 use crate::{
-    de::{DeserializeError, Deserializer, ReadStrError, ReadTagError}, ser::SerializeError, tag::{FloatWidth, IntWidth, OptionTag, StrNewIndex, StructType, TagParameter, TypeTag}, varint, Serializer, FORMAT_VERSION
+    reader::{ReadError, ReadResult, ReaderRef},
+    tag::{OptionTag, StructType, TagParameter, TypeTag},
+    writer::WriterRef,
+    SmolRead, SmolWrite,
 };
-
-pub(crate) const RAW_VALUE_MAGIC_STRING: &str = "smoldata::RAW::ef812e7a46e822cd";
 
 /// Represents serialized object bytes
 pub struct RawValue(Box<[u8]>);
 
-enum RawValueSerStack {
-    SingleObject,
-    Seq {
-        remaining: Option<usize>,
-    },
-    Map {
-        value_next: bool,
-        remaining: Option<usize>,
-        string_keys: bool,
-    },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RawValueReadingError {
-    #[error("Read invalid tag {0}")]
-    InvalidTag(u8),
-
-    #[error("Read invalid string id {0}")]
-    InvalidStringId(u32),
-
-    #[error("Read invalid UTF-8 data")]
-    InvalidUTF8String,
-
-    #[error("VarInt reading error")]
-    ReadVarint(
-        #[from]
-        #[source]
-        varint::VarIntReadError,
-    ),
-}
-
 impl RawValue {
-    pub(crate) fn deserialize_raw<R: io::Read>(
-        de: &mut Deserializer<R>,
-    ) -> Result<Vec<u8>, DeserializeError> {
-        let mut buf: Vec<u8> = vec![];
-        let mut se = Serializer::new_bare(&mut buf, 256);
-        let mut stack: Vec<RawValueSerStack> = vec![];
-        let mut first = true;
-
-        while first || !stack.is_empty() {
-            first = false;
-
-            if let Some(top) = stack.last_mut() {
-                match top {
-                    RawValueSerStack::SingleObject => {
-                        stack.pop();
-                    }
-                    RawValueSerStack::Seq { remaining } => match remaining {
-                        Some(0) => {
-                            stack.pop();
-                            continue;
-                        }
-                        Some(remaining) => *remaining -= 1,
-                        None => {
-                            if matches!(de.peek_tag()?, TypeTag::End) {
-                                se.write_tag(TypeTag::End)?;
-                                de.peek_tag_consume();
-                                stack.pop();
-                                continue;
-                            }
-                        }
-                    },
-                    RawValueSerStack::Map {
-                        value_next,
-                        remaining,
-                        string_keys,
-                    } => {
-                        if !*value_next {
-                            match remaining {
-                                Some(0) => {
-                                    stack.pop();
-                                    continue;
-                                }
-                                Some(remaining) => *remaining -= 1,
-                                None => {
-                                    if matches!(de.peek_tag()?, TypeTag::End) {
-                                        se.write_tag(TypeTag::End)?;
-                                        de.peek_tag_consume();
-                                        stack.pop();
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if *string_keys && !matches!(de.peek_tag()?, TypeTag::Str(_)) {
-                                return Err(DeserializeError::StringsOnly);
-                            }
-
-                            *value_next = true;
-                        } else {
-                            *value_next = false;
-                        }
-                    }
-                };
-            }
-
-            let tag = de.read_tag()?;
-
-            if let Some(str) = tag.get_str() {
-                let str = de.read_str(str)?;
-                se.write_cached_str(str, &|news| {
-                    let mut tag = tag;
-                    if let Some(s) = tag.get_str_mut() {
-                        *s = news;
-                    }
-                    tag
-                })?;
-            } else {
-                se.write_tag(tag)?;
-            }
-
-            match tag {
-                TypeTag::Unit | TypeTag::Bool(_) => {}
-                TypeTag::Integer {
-                    width,
-                    signed: _,
-                    varint,
-                } => {
-                    if varint {
-                        varint::copy_varint(&mut de.reader, &mut se.writer)?;
-                    } else {
-                        let mut buf = [0u8; IntWidth::MAX_BYTES];
-                        let slice = &mut buf[..width.bytes()];
-                        de.reader.read_exact(slice)?;
-                        se.writer.write_all(slice)?;
-                    }
-                }
-                TypeTag::Char { varint } => {
-                    if varint {
-                        varint::copy_varint(&mut de.reader, &mut se.writer)?;
-                    } else {
-                        let mut buf = [0u8; 4];
-                        de.reader.read_exact(&mut buf)?;
-                        se.writer.write_all(&buf)?;
-                    }
-                }
-                TypeTag::Float(width) => {
-                    let mut buf = [0u8; FloatWidth::MAX_BYTES];
-                    let slice = &mut buf[..width.bytes()];
-                    de.reader.read_exact(slice)?;
-                    se.writer.write_all(slice)?;
-                }
-                TypeTag::Str(_) => {}
-                TypeTag::StrDirect | TypeTag::Bytes => {
-                    let len = varint::read_unsigned_varint(&mut de.reader)?;
-                    varint::write_unsigned_varint(&mut se.writer, len)?;
-                    copy_data::<1024, _, _>(&mut de.reader, &mut se.writer, len)?;
-                }
-                TypeTag::EmptyStr => {}
-                TypeTag::Option(OptionTag::None) => {}
-                TypeTag::Option(OptionTag::Some) => {
-                    stack.push(RawValueSerStack::SingleObject);
-                }
-                TypeTag::Struct(StructType::Unit) => {}
-                TypeTag::Struct(StructType::Newtype) => {
-                    stack.push(RawValueSerStack::SingleObject);
-                }
-                TypeTag::Struct(StructType::Struct)
-                | TypeTag::EnumVariant {
-                    ty: StructType::Struct,
-                    str: _,
-                } => {
-                    let len = varint::read_unsigned_varint(&mut de.reader)?;
-                    varint::write_unsigned_varint(&mut se.writer, len)?;
-                    if len > 0 {
-                        stack.push(RawValueSerStack::Map {
-                            remaining: Some(len),
-                            string_keys: true,
-                            value_next: false,
-                        });
-                    }
-                }
-
-                TypeTag::Struct(StructType::Tuple)
-                | TypeTag::Tuple
-                | TypeTag::Seq { has_length: true }
-                | TypeTag::EnumVariant {
-                    ty: StructType::Tuple,
-                    str: _,
-                } => {
-                    let len = varint::read_unsigned_varint(&mut de.reader)?;
-                    varint::write_unsigned_varint(&mut se.writer, len)?;
-                    if len > 0 {
-                        stack.push(RawValueSerStack::Seq {
-                            remaining: Some(len),
-                        });
-                    }
-                }
-
-                TypeTag::EnumVariant {
-                    ty: StructType::Unit,
-                    str: _,
-                } => {}
-                TypeTag::EnumVariant {
-                    ty: StructType::Newtype,
-                    str: _,
-                } => {
-                    stack.push(RawValueSerStack::SingleObject);
-                }
-                TypeTag::Seq { has_length: false } => {
-                    stack.push(RawValueSerStack::Seq { remaining: None });
-                }
-                TypeTag::Map { has_length } => {
-                    let len = has_length
-                        .then(|| varint::read_unsigned_varint(&mut de.reader))
-                        .transpose()?;
-                    if let Some(len) = len {
-                        varint::write_unsigned_varint(&mut se.writer, len)?;
-                    }
-                    if len.is_none_or(|l| l > 0) {
-                        stack.push(RawValueSerStack::Map {
-                            remaining: len,
-                            string_keys: false,
-                            value_next: false,
-                        });
-                    }
-                }
-                TypeTag::End => return Err(DeserializeError::ReadEnd),
-            }
-        }
-
-        Ok(buf)
-    }
-
-    pub(crate) fn serialize_raw<W: io::Write>(data: &[u8], ser: &mut Serializer<W>) -> Result<(), SerializeError> {
-
-        let mut de = Deserializer::new_bare(io::Cursor::new(data), FORMAT_VERSION);
-
-        loop {
-            let tag = de.read_tag();
-
-            let tag = match tag {
-                Ok(tag) => tag,
-                Err(ReadTagError::IOError(e)) if matches!(e.kind(), io::ErrorKind::UnexpectedEof) => {
-                    break;
-                },
-                Err(ReadTagError::IOError(e)) => return Err(e.into()),
-                Err(ReadTagError::InvalidTag(i)) => return Err(RawValueReadingError::InvalidTag(i).into()),
-            };
-
-            let mut tag_args = tag.tag_params();
-            let mut write_tag = true;
-
-            if let Some(str_ty) = tag.get_str() {
-                let str = match de.read_str(str_ty) {
-                    Ok(s) => s,
-                    Err(ReadStrError::IOError(e)) => return Err(e.into()),
-                    Err(ReadStrError::InvalidStringId(i)) => return Err(RawValueReadingError::InvalidStringId(i).into()),
-                    Err(ReadStrError::InvalidUTF8String) => return Err(RawValueReadingError::InvalidUTF8String.into()),
-                    Err(ReadStrError::ReadVarint(e)) => return Err(RawValueReadingError::ReadVarint(e).into()),
-                };
-
-                ser.write_cached_str(str, &|s| {
-                    let mut tag = tag;
-                    if let Some(str) = tag.get_str_mut() {
-                        *str = s;
-                    };
-                    tag
-                })?;
-
-                write_tag = false;
-
-                let skip = match str_ty {
-                    StrNewIndex::New => 2,
-                    StrNewIndex::Index => 1,
-                };
-                tag_args = &tag_args[skip..];
-            }
-
-            if write_tag {
-                ser.write_tag(tag)?;
-            }
-
-            for arg in tag_args {
-                match arg {
-                    TagParameter::FixedIntBytes(width) => {
-                        let mut buf = [0u8; IntWidth::MAX_BYTES];
-                        let buf = &mut buf[..width.bytes()];
-                        de.reader.read_exact(buf)?;
-                        ser.writer.write_all(buf)?;
-                    },
-                    TagParameter::Varint => {
-                        varint::copy_varint(&mut de.reader, &mut ser.writer)?;
-                    },
-                    TagParameter::VarintLengthPrefixedBytearray => {
-                        let len = match varint::read_unsigned_varint(&mut de.reader) {
-                            Ok(len) => len,
-                            Err(e) => return Err(RawValueReadingError::ReadVarint(e).into()),
-                        };
-                        copy_data::<1024, _, _>(&mut de.reader, &mut ser.writer, len)?;
-                    },
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Warning: Data does not contain header or version info, not for storing
     pub fn bytes(&self) -> &[u8] {
         &self.0
@@ -322,26 +24,10 @@ impl RawValue {
         self.0
     }
 
-    /// Will error on serializarion if invalid data was provided
+    /// Will error on (de)serializarion if invalid data was provided
     /// Assumes data is of the current version of the format
     pub fn from_bytes(data: Box<[u8]>) -> Self {
         Self(data)
-    }
-
-    pub fn create_deserializer(&self) -> Deserializer<io::Cursor<&'_ [u8]>> {
-        let cur = io::Cursor::new(self.0.deref());
-        Deserializer::new_bare(cur, FORMAT_VERSION)
-    }
-
-    pub fn deserialize_into<T: DeserializeOwned>(&self) -> Result<T, DeserializeError> {
-        T::deserialize(&mut self.create_deserializer())
-    }
-
-    pub fn serialize_from<T: Serialize>(value: &T) -> Result<Self, SerializeError> {
-        let mut buf = vec![];
-        let mut ser = Serializer::new_bare(&mut buf, 256);
-        value.serialize(&mut ser)?;
-        Ok(Self(buf.into_boxed_slice()))
     }
 }
 
@@ -351,366 +37,342 @@ impl fmt::Debug for RawValue {
     }
 }
 
-impl<'de> Deserialize<'de> for RawValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_newtype_struct(RAW_VALUE_MAGIC_STRING, RawValueVisitor)
+enum RawValueCopyStack {
+    Object,
+    Seq {
+        remaining: Option<usize>,
+    },
+    Map {
+        value_next: bool,
+        remaining: Option<usize>,
+    },
+    Struct {
+        remaining: usize,
+    },
+}
+
+macro_rules! const_assert {
+    ($($tt:tt)*) => {
+        const _: () = {
+            assert!($($tt)*);
+        };
+    };
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid data while writing a RawValue")]
+pub struct InvalidRawValueData(ReadError);
+
+impl SmolRead for RawValue {
+    fn read(mut main_reader: crate::reader::ValueReader) -> crate::reader::ReadResult<Self> {
+        let reader = main_reader.reader.get();
+        let mut vec = vec![];
+        let mut main_writer = crate::writer::Writer::new(&mut vec);
+        let writer = main_writer.get_ref();
+
+        copy_object(reader, writer)?;
+
+        main_reader.reader.finish();
+
+        Ok(RawValue(vec.into_boxed_slice()))
     }
 }
 
-struct RawValueVisitor;
+impl SmolWrite for RawValue {
+    fn write(&self, mut main_writer: crate::writer::ValueWriter) -> io::Result<()> {
+        let mut cursor = std::io::Cursor::new(&self.0);
+        let mut main_reader = crate::reader::Reader::new(&mut cursor);
+        let reader = main_reader.get_ref();
+        let writer = main_writer.writer.get();
 
-impl Visitor<'_> for RawValueVisitor {
-    type Value = RawValue;
+        copy_object(reader, writer).map_err(|e| match *e {
+            ReadError::Io(e) => e,
+            e => io::Error::new(ErrorKind::InvalidData, InvalidRawValueData(e)),
+        })?;
 
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("RawValue data")
-    }
+        main_writer.writer.finish();
 
-    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(RawValue(v.into()))
-    }
-}
-
-impl Serialize for RawValue {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_newtype_struct(RAW_VALUE_MAGIC_STRING, &RawValueBytes(self.bytes()))
+        Ok(())
     }
 }
 
-struct RawValueBytes<'a>(&'a [u8]);
-
-impl Serialize for RawValueBytes<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer {
-        serializer.serialize_bytes(self.0)
-    }
-}
-
-pub(crate) struct RawValueSerializer<'a, W: io::Write> {
-    pub ser: &'a mut Serializer<W>,
-}
-
-impl<W: io::Write> serde::Serializer for RawValueSerializer<'_, W> {
-    type Ok = ();
-    type Error = SerializeError;
-
-    type SerializeSeq = SerdeSerializerStub<(), SerializeError>;
-    type SerializeTuple = SerdeSerializerStub<(), SerializeError>;
-    type SerializeTupleStruct = SerdeSerializerStub<(), SerializeError>;
-    type SerializeTupleVariant = SerdeSerializerStub<(), SerializeError>;
-    type SerializeMap = SerdeSerializerStub<(), SerializeError>;
-    type SerializeStruct = SerdeSerializerStub<(), SerializeError>;
-    type SerializeStructVariant = SerdeSerializerStub<(), SerializeError>;
-
-    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_u8(self, _v: u8) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_u16(self, _v: u16) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_u32(self, _v: u32) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_u64(self, _v: u64) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        RawValue::serialize_raw(v, self.ser)
-    }
-
-    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_some<T>(self, _value: &T) -> Result<Self::Ok, Self::Error>
-    where
-        T: ?Sized + Serialize,
-    {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-    ) -> Result<Self::Ok, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_newtype_struct<T>(
-        self,
-        _name: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error>
-    where
-        T: ?Sized + Serialize,
-    {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_newtype_variant<T>(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error>
-    where
-        T: ?Sized + Serialize,
-    {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStruct, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        panic!("Invalid use of RawValueSeriazizer")
-    }
-}
-
-pub(crate) struct SerdeSerializerStub<Ok, Error: serde::ser::Error>(PhantomData<(Ok, Error)>);
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeTupleVariant for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_field<T>(&mut self, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeTupleStruct for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_field<T>(&mut self, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeTuple for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_element<T>(&mut self, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeStructVariant for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_field<T>(&mut self, _key: &'static str, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeStruct for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_field<T>(&mut self, _key: &'static str, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeMap for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_key<T>(&mut self, _key: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn serialize_value<T>(&mut self, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-impl<Ok, Error: serde::ser::Error> serde::ser::SerializeSeq for SerdeSerializerStub<Ok, Error> {
-    type Ok = Ok;
-
-    type Error = Error;
-
-    fn serialize_element<T>(&mut self, _value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Serialize {
-        panic!("stub called!")
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        panic!("stub called!")
-    }
-}
-
-fn copy_data<const BUF_SIZE: usize, S: io::Read, D: io::Write>(
-    src: &mut S,
-    dst: &mut D,
-    mut amount: usize,
-) -> Result<(), io::Error> {
-    let mut buf = [0u8; BUF_SIZE];
-    while amount > 0 {
-        let size = amount.min(BUF_SIZE);
-        let slice = &mut buf[..size];
-
-        let read = src.read(slice)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "EOF while copying data",
-            ));
+fn copy_object(mut reader: ReaderRef, mut writer: WriterRef) -> ReadResult<()> {
+    let mut stack: Vec<RawValueCopyStack> = vec![RawValueCopyStack::Object];
+    loop {
+        let Some(top) = stack.last_mut() else {
+            break Ok(());
+        };
+
+        match top {
+            RawValueCopyStack::Object => {
+                stack.pop();
+            }
+            RawValueCopyStack::Seq { remaining: None } => {
+                if matches!(reader.peek_tag()?, TypeTag::End) {
+                    writer.write_tag(TypeTag::End).map_err(ReadError::from)?;
+                    reader.consume_peek();
+                    stack.pop();
+                    continue;
+                }
+            }
+            RawValueCopyStack::Seq { remaining: Some(0) } => {
+                stack.pop();
+                continue;
+            }
+            RawValueCopyStack::Seq {
+                remaining: Some(remaining),
+            } => {
+                *remaining -= 1;
+            }
+
+            RawValueCopyStack::Map {
+                value_next: value_next @ true,
+                ..
+            } => {
+                *value_next = false;
+            }
+            RawValueCopyStack::Map {
+                value_next: false,
+                remaining: None,
+            } => {
+                if matches!(reader.peek_tag()?, TypeTag::End) {
+                    writer.write_tag(TypeTag::End).map_err(ReadError::from)?;
+                    reader.consume_peek();
+                    stack.pop();
+                    continue;
+                }
+            }
+            RawValueCopyStack::Map {
+                value_next: false,
+                remaining: Some(0),
+            } => {
+                stack.pop();
+                continue;
+            }
+
+            RawValueCopyStack::Map {
+                value_next: false,
+                remaining: Some(remaining),
+            } => {
+                *remaining -= 1;
+            }
+            RawValueCopyStack::Struct { remaining: 0 } => {
+                stack.pop();
+                continue;
+            }
+            RawValueCopyStack::Struct { remaining } => {
+                let name = reader.read_str()?;
+                writer.write_str(name.into()).map_err(ReadError::from)?;
+                *remaining -= 1;
+            }
         }
-        let slice = &slice[..read];
-        dst.write_all(slice)?;
 
-        amount -= read;
+        let tag = reader.read_tag()?;
+
+        writer.write_tag(tag).map_err(ReadError::from)?;
+
+        match tag {
+            TypeTag::Unit
+            | TypeTag::Bool(_)
+            | TypeTag::Integer { .. }
+            | TypeTag::Char { .. }
+            | TypeTag::Float(_)
+            | TypeTag::Str
+            | TypeTag::StrDirect
+            | TypeTag::EmptyStr
+            | TypeTag::Bytes
+            | TypeTag::Option(OptionTag::None)
+            | TypeTag::Struct(StructType::Unit)
+            | TypeTag::EnumVariant(StructType::Unit) => {
+                copy_tag_params(reader.clone(), writer.clone(), tag)?;
+            }
+            TypeTag::Option(OptionTag::Some) | TypeTag::Struct(StructType::Newtype) => {
+                const_assert!(TypeTag::Option(OptionTag::Some).tag_params().is_empty());
+                const_assert!(TypeTag::Struct(StructType::Newtype).tag_params().is_empty());
+
+                stack.push(RawValueCopyStack::Object);
+            }
+            TypeTag::EnumVariant(StructType::Newtype) => {
+                const_assert!(matches!(
+                    TypeTag::EnumVariant(StructType::Newtype).tag_params(),
+                    [TagParameter::StringRef]
+                ));
+
+                let name = reader.read_str()?;
+                writer.write_str(name.into()).map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Object);
+            }
+            TypeTag::Struct(StructType::Tuple) => {
+                const_assert!(matches!(
+                    TypeTag::Struct(StructType::Tuple).tag_params(),
+                    [TagParameter::Varint]
+                ));
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Seq {
+                    remaining: Some(len),
+                });
+            }
+            TypeTag::Struct(StructType::Struct) => {
+                const_assert!(matches!(
+                    TypeTag::Struct(StructType::Struct).tag_params(),
+                    [TagParameter::Varint]
+                ));
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Struct { remaining: len });
+            }
+            TypeTag::EnumVariant(StructType::Tuple) => {
+                const_assert!(matches!(
+                    TypeTag::EnumVariant(StructType::Tuple).tag_params(),
+                    [TagParameter::StringRef, TagParameter::Varint]
+                ));
+
+                let name = reader.read_str()?;
+                writer.write_str(name.into()).map_err(ReadError::from)?;
+
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Seq {
+                    remaining: Some(len),
+                });
+            }
+            TypeTag::EnumVariant(StructType::Struct) => {
+                const_assert!(matches!(
+                    TypeTag::EnumVariant(StructType::Struct).tag_params(),
+                    [TagParameter::StringRef, TagParameter::Varint]
+                ));
+
+                let name = reader.read_str()?;
+                writer.write_str(name.into()).map_err(ReadError::from)?;
+
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Struct { remaining: len });
+            }
+            TypeTag::Array { has_length: true } => {
+                const_assert!(matches!(
+                    TypeTag::Array { has_length: true }.tag_params(),
+                    [TagParameter::Varint]
+                ));
+
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Seq {
+                    remaining: Some(len),
+                });
+            }
+            TypeTag::Array { has_length: false } => {
+                const_assert!(TypeTag::Array { has_length: false }.tag_params().is_empty());
+
+                stack.push(RawValueCopyStack::Seq { remaining: None });
+            }
+            TypeTag::Tuple => {
+                const_assert!(matches!(
+                    TypeTag::Tuple.tag_params(),
+                    [TagParameter::Varint]
+                ));
+
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Seq {
+                    remaining: Some(len),
+                });
+            }
+            TypeTag::Map { has_length: true } => {
+                const_assert!(matches!(
+                    TypeTag::Map { has_length: true }.tag_params(),
+                    [TagParameter::Varint]
+                ));
+
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                crate::varint::write_unsigned_varint(writer.inner(), len)
+                    .map_err(ReadError::from)?;
+
+                stack.push(RawValueCopyStack::Map {
+                    value_next: false,
+                    remaining: Some(len),
+                });
+            }
+            TypeTag::Map { has_length: false } => {
+                const_assert!(TypeTag::Map { has_length: false }.tag_params().is_empty());
+
+                stack.push(RawValueCopyStack::Map {
+                    value_next: false,
+                    remaining: None,
+                });
+            }
+            TypeTag::End => return Err(ReadError::UnexpectedEnd.into()),
+        }
     }
+}
 
+fn copy_tag_params(mut reader: ReaderRef, mut writer: WriterRef, tag: TypeTag) -> ReadResult<()> {
+    let mut buf = [0u8; 256];
+    for param in tag.tag_params() {
+        match *param {
+            TagParameter::ShortBytes { len } => {
+                let buf = &mut buf[..(len as usize)];
+                reader.read_exact(buf).map_err(ReadError::from)?;
+                writer.write_all(buf).map_err(ReadError::from)?;
+            }
+            TagParameter::Varint => {
+                crate::varint::copy_varint(reader.inner(), writer.inner())
+                    .map_err(ReadError::from)?;
+            }
+            TagParameter::VarintLengthPrefixedBytearray => {
+                let len: usize =
+                    crate::varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
+
+                let mut remaining = len;
+                while remaining > 0 {
+                    let read = remaining.min(buf.len());
+                    let buf = &mut buf[..read];
+                    let read = reader.read(buf).map_err(ReadError::from)?;
+                    if read == 0 {
+                        return Err(ReadError::Io(io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "read no data while copying a tag",
+                        ))
+                        .into());
+                    }
+                    let buf = &buf[..read];
+                    writer.write_all(buf).map_err(ReadError::from)?;
+                    remaining -= read;
+                }
+            }
+            TagParameter::StringRef => {
+                let str = reader.read_str()?;
+                writer.write_str(str.into()).map_err(ReadError::from)?;
+            }
+        }
+    }
     Ok(())
 }

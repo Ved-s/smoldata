@@ -36,10 +36,6 @@ fn derive_from_tokens(
         });
     };
 
-    if let Err(e) = disallow_attributes(&input.attrs) {
-        add_error(e);
-    }
-
     for param in &input.generics.params {
         let attrs = match param {
             syn::GenericParam::Lifetime(v) => &v.attrs,
@@ -51,11 +47,17 @@ fn derive_from_tokens(
         }
     }
 
+    let mut type_attrs = InputTypeAttributes::default();
+    if let Err(e) = read_attributes_into(&input.attrs, &mut type_attrs) {
+        add_error(e);
+    }
+
     let input_ident_span = input.ident.span();
     let input = MacroInput {
         ty,
         type_name: input.ident,
         generics: input.generics,
+        type_attrs,
         inty: match input.data {
             syn::Data::Union(_) => {
                 return compile_error(
@@ -200,16 +202,38 @@ fn derive_from_tokens(
 }
 
 fn derive_from_parsed(input: &MacroInput) -> TokenStream {
+
+    let codegen_data = CodegenData {
+        base_crate: input.type_attrs.smoldata.clone().unwrap_or_else(|| {
+
+            // #base_crate
+            syn::Path {
+                leading_colon: Some(syn::token::PathSep {
+                    spans: [
+                        Span::call_site(), Span::call_site()
+                    ]
+                }),
+                segments: syn::punctuated::Punctuated::from_iter([
+                    syn::PathSegment {
+                        arguments: syn::PathArguments::None,
+                        ident: Ident::new("smoldata", Span::call_site())
+                    }
+                ]),
+            }
+        })
+    };
+
     let (impl_gen, type_gen, where_gen) = input.generics.split_for_impl();
+    let base_crate = &codegen_data.base_crate;
 
     let read = if input.ty.read() {
         let reader = Ident::new("reader", Span::call_site());
-        let imp = impl_derive_method(TraitType::Read, &input.inty, &reader);
+        let imp = impl_derive_method(TraitType::Read, &input.inty, &reader, &codegen_data);
         let type_name = &input.type_name;
 
         quote! {
-            impl #impl_gen ::smoldata::SmolRead for #type_name #type_gen #where_gen {
-                fn read(#reader: ::smoldata::reader::ValueReader) -> ::smoldata::reader::ReadResult<Self> {
+            impl #impl_gen #base_crate::SmolRead for #type_name #type_gen #where_gen {
+                fn read(#reader: #base_crate::reader::ValueReader) -> #base_crate::reader::ReadResult<Self> {
                     #imp
                 }
             }
@@ -220,12 +244,12 @@ fn derive_from_parsed(input: &MacroInput) -> TokenStream {
 
     let write = if input.ty.write() {
         let writer = Ident::new("writer", Span::call_site());
-        let imp = impl_derive_method(TraitType::Write, &input.inty, &writer);
+        let imp = impl_derive_method(TraitType::Write, &input.inty, &writer, &codegen_data);
         let type_name = &input.type_name;
 
         quote! {
-            impl #impl_gen ::smoldata::SmolWrite for #type_name #type_gen #where_gen {
-                fn write(&self, #writer: ::smoldata::writer::ValueWriter) -> ::std::io::Result<()> {
+            impl #impl_gen #base_crate::SmolWrite for #type_name #type_gen #where_gen {
+                fn write(&self, #writer: #base_crate::writer::ValueWriter) -> ::std::io::Result<()> {
                     #imp
                 }
             }
@@ -240,19 +264,19 @@ fn derive_from_parsed(input: &MacroInput) -> TokenStream {
     }
 }
 
-fn impl_derive_method(trty: TraitType, inty: &InputType, reader_writer: &Ident) -> TokenStream {
+fn impl_derive_method(trty: TraitType, inty: &InputType, reader_writer: &Ident, data: &CodegenData) -> TokenStream {
     match (trty, inty) {
         (TraitType::Read, InputType::Struct(fields)) => {
-            impl_derive_struct_read_method(fields, reader_writer)
+            impl_derive_struct_read_method(fields, reader_writer, data)
         }
         (TraitType::Read, InputType::Enum(variants)) => {
-            impl_derive_enum_read_method(variants, reader_writer)
+            impl_derive_enum_read_method(variants, reader_writer, data)
         }
         (TraitType::Write, InputType::Struct(fields)) => {
-            impl_derive_struct_write_method(fields, reader_writer)
+            impl_derive_struct_write_method(fields, reader_writer, data)
         }
         (TraitType::Write, InputType::Enum(variants)) => {
-            impl_derive_enum_write_method(variants, reader_writer)
+            impl_derive_enum_write_method(variants, reader_writer, data)
         }
     }
 }
@@ -260,10 +284,12 @@ fn impl_derive_method(trty: TraitType, inty: &InputType, reader_writer: &Ident) 
 fn gen_struct_write(
     fields: &[NamedTypeField],
     writer: &Ident,
+    data: &CodegenData,
     variant_data_name: Option<&StringLitOrPath>,
     field_accessor: &dyn Fn(&NamedTypeField) -> TokenStream,
 ) -> TokenStream {
     let nfields = fields.len();
+    let base_crate = &data.base_crate;
 
     let write_fields = fields.iter().map(|field| {
         let data_name = &field.data_name;
@@ -271,7 +297,7 @@ fn gen_struct_write(
         let accessor = field_accessor(field);
 
         quote! {
-            <#ty as ::smoldata::SmolWrite>::write(#accessor, struc.write_field(#data_name)?)?;
+            <#ty as #base_crate::SmolWrite>::write(#accessor, struc.write_field(#data_name)?)?;
         }
     });
 
@@ -286,8 +312,8 @@ fn gen_struct_write(
     }
 }
 
-fn impl_derive_struct_write_method(fields: &[NamedTypeField], writer: &Ident) -> TokenStream {
-    let body = gen_struct_write(fields, writer, None, &|field| {
+fn impl_derive_struct_write_method(fields: &[NamedTypeField], writer: &Ident, data: &CodegenData) -> TokenStream {
+    let body = gen_struct_write(fields, writer, data, None, &|field| {
         let name = &field.name;
         quote! { &self.#name }
     });
@@ -297,7 +323,9 @@ fn impl_derive_struct_write_method(fields: &[NamedTypeField], writer: &Ident) ->
     }
 }
 
-fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident) -> TokenStream {
+fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident, data: &CodegenData) -> TokenStream {
+    let base_crate = &data.base_crate;
+    
     let member_impls = variants.iter().map(|v| {
         let EnumVariant { name, data_name, ty, .. } = v;
 
@@ -311,7 +339,7 @@ fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident) -> To
                 let ty = &field.ty;
                 quote! {
                     Self::#name(v) => {
-                        <#ty as ::smoldata::SmolWrite>::write(v, writer.write_newtype_variant(#data_name)?)?;
+                        <#ty as #base_crate::SmolWrite>::write(v, writer.write_newtype_variant(#data_name)?)?;
                     }
                 }
             },
@@ -326,7 +354,7 @@ fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident) -> To
                     let name = &field.name;
                     let ty = &field.ty;
                     quote! {
-                        <#ty as ::smoldata::SmolWrite>::write(#name, tup.write_value())?;
+                        <#ty as #base_crate::SmolWrite>::write(#name, tup.write_value())?;
                     }
                 });
 
@@ -345,7 +373,7 @@ fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident) -> To
                     quote! { #from: #to }
                 });
                 let body = gen_struct_write(
-                    fields, writer, Some(data_name),
+                    fields, writer, data, Some(data_name),
                     &|field| {
                         Ident::new(&format!("f_{}", field.name_str), Span::call_site())
                             .into_token_stream()
@@ -371,10 +399,12 @@ fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident) -> To
 fn gen_struct_read(
     fields: &[NamedTypeField],
     reader: &Ident,
+    data: &CodegenData,
     variant_name: Option<&str>,
 
     struct_builder: &dyn Fn(&mut dyn Iterator<Item = TokenStream>) -> TokenStream,
 ) -> TokenStream {
+    let base_crate = &data.base_crate;
     let fields: Vec<_> = fields
         .iter()
         .map(|field| {
@@ -398,13 +428,13 @@ fn gen_struct_read(
         quote! {
             #data_name => {
                 if #tmp_ident.is_some() {
-                    return Err(::smoldata::reader::ReadError::DuplicateStructField {
+                    return Err(#base_crate::reader::ReadError::DuplicateStructField {
                         name: #name_str,
                         type_name: ::std::any::type_name::<Self>(),
                     }
                     .into());
                 }
-                #tmp_ident = Some(<#ty as ::smoldata::SmolRead>::read(field.1)?);
+                #tmp_ident = Some(<#ty as #base_crate::SmolRead>::read(field.1)?);
             }
         }
     });
@@ -412,7 +442,7 @@ fn gen_struct_read(
     let unwraps = fields.iter().map(|(field, tmp_ident)| {
         let name_str = &field.name_str;
         quote! {
-            let #tmp_ident = #tmp_ident.ok_or_else(|| ::smoldata::reader::ReadError::MissingStructField {
+            let #tmp_ident = #tmp_ident.ok_or_else(|| #base_crate::reader::ReadError::MissingStructField {
                 name: #name_str,
                 type_name: ::std::any::type_name::<Self>(),
             })?;
@@ -440,7 +470,7 @@ fn gen_struct_read(
     quote! {
         let mut struc = #reader
             .#reader_call
-            .map_err(::smoldata::reader::ReadError::from)?;
+            .map_err(#base_crate::reader::ReadError::from)?;
 
         #(#tmp_defs)*
 
@@ -449,7 +479,7 @@ fn gen_struct_read(
                 #(#reads)*
 
                 _ => {
-                    return Err(::smoldata::reader::ReadError::UnexpectedStructField {
+                    return Err(#base_crate::reader::ReadError::UnexpectedStructField {
                         name: field.0,
                         type_name: ::std::any::type_name::<Self>(),
                     }
@@ -464,16 +494,18 @@ fn gen_struct_read(
     }
 }
 
-fn impl_derive_struct_read_method(fields: &[NamedTypeField], reader: &Ident) -> TokenStream {
+fn impl_derive_struct_read_method(fields: &[NamedTypeField], reader: &Ident, data: &CodegenData) -> TokenStream {
     gen_struct_read(
         fields,
         reader,
+        data,
         None,
         &|fields| quote! { Ok(Self { #(#fields,)* }) },
     )
 }
 
-fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> TokenStream {
+fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident, data: &CodegenData) -> TokenStream {
+    let base_crate = &data.base_crate;
     let variants_impl = variants.iter().map(|var| {
         let name = &var.name;
         let name_str = &var.name_str;
@@ -486,8 +518,8 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                         #reader
                             .take_unit_variant()
                             .map_err(|e|
-                                ::smoldata::reader::ReadError::from(
-                                    e.with_variant_name(type_name::<Self>(), #name_str)
+                                #base_crate::reader::ReadError::from(
+                                    e.with_variant_name(::std::any::type_name::<Self>(), #name_str)
                                 )
                             )?;
                         Self::#name
@@ -498,12 +530,12 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                 let ty = &field.ty;
                 quote! {
                     #data_name => {
-                        Self::#name(<#ty as ::smoldata::SmolRead>::read(
+                        Self::#name(<#ty as #base_crate::SmolRead>::read(
                         #reader
                             .take_newtype_variant()
                             .map_err(|e|
-                                ::smoldata::reader::ReadError::from(
-                                    e.with_variant_name(type_name::<Self>(), #name_str)
+                                #base_crate::reader::ReadError::from(
+                                    e.with_variant_name(::std::any::type_name::<Self>(), #name_str)
                                 )
                             )?
                         )?)
@@ -523,7 +555,7 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                             break 'read;
                         };
 
-                        let #name = <#ty as ::smoldata::SmolRead>::read(#reader)?;
+                        let #name = <#ty as #base_crate::SmolRead>::read(#reader)?;
                     }
                 });
 
@@ -534,8 +566,8 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                         let mut tuple = #reader
                             .take_tuple_variant()
                             .map_err(|e|
-                                ::smoldata::reader::ReadError::from(
-                                    e.with_variant_name(type_name::<Self>(), #name_str)
+                                #base_crate::reader::ReadError::from(
+                                    e.with_variant_name(::std::any::type_name::<Self>(), #name_str)
                                 )
                             )?;
 
@@ -551,7 +583,7 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                                 break 'outer Self::#name(#(#field_names,)*);
                             }
 
-                            return Err(::smoldata::reader::ReadError::UnexpectedLength {
+                            return Err(#base_crate::reader::ReadError::UnexpectedLength {
                                 expected: 3,
                                 got: length,
                                 type_name: ::std::any::type_name::<Self>(),
@@ -562,7 +594,7 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
                 }
             }
             EnumVariantType::Struct(fields) => {
-                let body = gen_struct_read(fields, reader, Some(&name_str), &|fields| {
+                let body = gen_struct_read(fields, reader, data, Some(&name_str), &|fields| {
                     quote! {
                         Self::#name { #(#fields,)* }
                     }
@@ -582,16 +614,16 @@ fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident) -> Tok
             .read()?
             .take_enum()
             .map_err(|e| e.with_type_name_of::<Self>())
-            .map_err(::smoldata::reader::ReadError::from)?
+            .map_err(#base_crate::reader::ReadError::from)?
             .read_variant()?;
 
         let (name, #reader) = var;
 
-        Ok(match name.deref() {
+        Ok(match std::ops::Deref::deref(&name) {
             #(#variants_impl)*
 
             _ => {
-                return Err(::smoldata::reader::ReadError::UnexpectedEnumVariant {
+                return Err(#base_crate::reader::ReadError::UnexpectedEnumVariant {
                     name,
                     type_name: ::std::any::type_name::<Self>(),
                 }
@@ -613,8 +645,13 @@ fn compile_error(span: Span, message: &str) -> TokenStream {
 struct MacroInput {
     ty: TraitTypeAll,
     type_name: Ident,
+    type_attrs: InputTypeAttributes,
     generics: Generics,
     inty: InputType,
+}
+
+struct CodegenData {
+    base_crate: syn::Path
 }
 
 #[derive(Clone, Copy)]
@@ -722,7 +759,7 @@ impl syn::parse::Parse for StringLitOrPath {
 }
 
 macro_rules! define_attributes {
-    (
+    {
         #[target = $target:literal]
         $(#[$meta:meta])*
         struct $name:ident {
@@ -730,7 +767,7 @@ macro_rules! define_attributes {
                 $attrname:ident: $attrty:ty
             ),* $(,)?
         }
-    ) => {
+    } => {
         $(#[$meta])*
         #[derive(Default)]
         struct $name {
@@ -789,6 +826,13 @@ define_attributes! {
     #[target = "struct field"]
     struct StructFieldAttributes {
         rename: StringLitOrPath,
+    }
+}
+
+define_attributes! {
+    #[target = "type"]
+    struct InputTypeAttributes {
+        smoldata: syn::Path
     }
 }
 

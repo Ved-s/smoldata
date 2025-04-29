@@ -73,9 +73,14 @@ impl<'a> Writer<'a> {
 
         self.writer
     }
+
+    #[allow(unused)]
+    pub(crate) fn get_ref(&mut self) -> WriterRef<'a, '_> {
+        WriterRef { writer: self }
+    }
 }
 
-struct WriterLevel<'rf, 'wr> {
+pub(crate) struct WriterLevel<'rf, 'wr> {
     writer: &'rf mut Writer<'wr>,
 
     #[cfg(smoldata_int_dev_error_checks)]
@@ -84,7 +89,7 @@ struct WriterLevel<'rf, 'wr> {
 
 impl<'wr> WriterLevel<'_, 'wr> {
     #[track_caller]
-    fn get(&mut self) -> WriterRef<'_, 'wr> {
+    pub fn get(&mut self) -> WriterRef<'_, 'wr> {
         #[cfg(smoldata_int_dev_error_checks)]
         if self.level.is_some_and(|l| l.get() < self.writer.level) {
             panic!("Attempt to use a Writer before finishing its children")
@@ -97,7 +102,7 @@ impl<'wr> WriterLevel<'_, 'wr> {
     }
 
     #[track_caller]
-    fn finish(&mut self) {
+    pub fn finish(&mut self) {
         #[cfg(smoldata_int_dev_error_checks)]
         {
             let level = match self.level {
@@ -131,7 +136,7 @@ impl<'wr> WriterLevel<'_, 'wr> {
 
     /// Begin a new writer below this one
     #[track_caller]
-    fn begin_sub_level(&mut self) -> WriterLevel<'_, 'wr> {
+    pub fn begin_sub_level(&mut self) -> WriterLevel<'_, 'wr> {
         #[cfg(smoldata_int_dev_error_checks)]
         let level = {
             let level = match self.level {
@@ -155,7 +160,7 @@ impl<'wr> WriterLevel<'_, 'wr> {
 
     /// Finish this writer and continue current level on a new one
     #[track_caller]
-    fn continue_level(&mut self) -> WriterLevel<'_, 'wr> {
+    pub fn continue_level(&mut self) -> WriterLevel<'_, 'wr> {
         #[cfg(smoldata_int_dev_error_checks)]
         let level = {
             let level = match self.level {
@@ -179,17 +184,17 @@ impl<'wr> WriterLevel<'_, 'wr> {
     }
 }
 
-struct WriterRef<'rf, 'wr> {
+pub(crate) struct WriterRef<'rf, 'wr> {
     writer: &'rf mut Writer<'wr>,
 }
 
 #[allow(unused)]
 impl<'wr> WriterRef<'_, 'wr> {
-    fn write_tag(&mut self, tag: TypeTag) -> io::Result<()> {
+    pub fn write_tag(&mut self, tag: TypeTag) -> io::Result<()> {
         tag.write(self.deref_mut())
     }
 
-    fn write_str(&mut self, str: RefArcStr) -> io::Result<()> {
+    pub fn write_str(&mut self, str: RefArcStr) -> io::Result<()> {
         match self.writer.string_map.get(str.deref()) {
             Some(r) => {
                 varint::write_varint_with_sign(&mut self.writer.writer, *r, Sign::Positive)?;
@@ -210,11 +215,11 @@ impl<'wr> WriterRef<'_, 'wr> {
         Ok(())
     }
 
-    fn inner(&mut self) -> &mut dyn io::Write {
+    pub fn inner(&mut self) -> &mut dyn io::Write {
         &mut self.writer.writer
     }
 
-    fn clone(&mut self) -> WriterRef<'_, 'wr> {
+    pub fn clone(&mut self) -> WriterRef<'_, 'wr> {
         WriterRef {
             writer: self.writer,
         }
@@ -236,7 +241,7 @@ impl DerefMut for WriterRef<'_, '_> {
 }
 
 pub struct ValueWriter<'rf, 'wr> {
-    writer: WriterLevel<'rf, 'wr>,
+    pub(crate) writer: WriterLevel<'rf, 'wr>,
 }
 
 #[allow(unused)]

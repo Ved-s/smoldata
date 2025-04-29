@@ -1,57 +1,63 @@
 use std::{collections::HashMap, fmt, io};
 
-use serde::{ser::SerializeSeq, Deserialize, Serialize};
+use crate::{SmolRead, SmolReadWrite, SmolWrite};
 
-use crate::{RawValue, FORMAT_VERSION};
+#[cfg(feature = "raw_value")]
+use crate::raw::RawValue;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+const VECTOR_FIELD_NAME: &str = "vector";
+
+#[derive(Debug, SmolReadWrite, PartialEq, Eq)]
+#[sd(smoldata = crate)]
 enum Enum {
     A(i32),
     B,
+
+    #[sd(rename = "See")]
     C(String, i32, u32),
+
     D {
-        v: NoLenSerialize<u32>
-    }
+        #[sd(rename = VECTOR_FIELD_NAME)]
+        v: NoLenSerialize<u32>,
+    },
 }
 
-#[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Debug, SmolReadWrite)]
+#[sd(smoldata = crate)]
 struct Struct {
     values: HashMap<i32, String>,
     e: Vec<Enum>,
-    tup: (bool, u128)
+    tup: (bool, u128),
 }
 
 #[allow(unused)]
-#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "raw_value")]
+#[derive(Debug, SmolReadWrite)]
+#[sd(smoldata = crate)]
 struct StructWithRaw {
     values: HashMap<i32, String>,
     e: RawValue,
-    tup: (bool, u128)
+    tup: (bool, u128),
 }
 
 #[derive(PartialEq, Eq)]
 struct NoLenSerialize<V>(Vec<V>);
 
-impl<V: Serialize> Serialize for NoLenSerialize<V> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer {
-        
-        let mut seq = serializer.serialize_seq(None)?;
+impl<V: SmolWrite> SmolWrite for NoLenSerialize<V> {
+    fn write(&self, writer: crate::writer::ValueWriter) -> io::Result<()> {
+        let mut writer = writer.write_seq(None)?;
 
-        for v in &self.0 {
-            seq.serialize_element(v)?;
+        for i in &self.0 {
+            i.write(writer.write_value())?;
         }
 
-        seq.end()
+        writer.finish()
     }
 }
 
-impl<'de, V: Deserialize<'de>> Deserialize<'de> for NoLenSerialize<V> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de> {
-        Ok(Self(Vec::deserialize(deserializer)?))
+impl<V: SmolRead> SmolRead for NoLenSerialize<V> {
+    fn read(reader: crate::reader::ValueReader) -> crate::reader::ReadResult<Self> {
+        Vec::read(reader).map(Self)
     }
 }
 
@@ -71,7 +77,7 @@ fn test_reserialize_complex() {
         ]),
         e: vec![
             Enum::D {
-                v: NoLenSerialize(vec![0, 5, 10, 15])
+                v: NoLenSerialize(vec![0, 5, 10, 15]),
             },
             Enum::C("somelongstring".into(), 32, 64),
             Enum::A(11),
@@ -85,6 +91,7 @@ fn test_reserialize_complex() {
 }
 
 #[test]
+#[cfg(feature = "raw_value")]
 fn test_raw() {
     let data = Struct {
         values: HashMap::from_iter([
@@ -94,7 +101,7 @@ fn test_raw() {
         ]),
         e: vec![
             Enum::D {
-                v: NoLenSerialize(vec![0, 5, 10, 15])
+                v: NoLenSerialize(vec![0, 5, 10, 15]),
             },
             Enum::C("somelongstring".into(), 32, 64),
             Enum::A(11),
@@ -106,59 +113,84 @@ fn test_raw() {
     };
 
     println!("Starting data: {data:?}\n");
-    
+
     let mut vec = vec![];
-    let mut ser = super::ser::Serializer::new(&mut vec, 256).unwrap();
-    data.serialize(&mut ser).unwrap();
+
+    let mut writer = super::writer::Writer::new(&mut vec);
+
+    data.write(writer.write()).unwrap();
 
     println!("Serialized data:");
     hexdump(&vec);
+    println!();
 
-    let mut de = super::de::Deserializer::new(io::Cursor::new(vec)).unwrap();
-    let with_raw = StructWithRaw::deserialize(&mut de).unwrap();
+    let mut cur = io::Cursor::new(vec);
+
+    let mut reader = super::reader::Reader::new(&mut cur);
+
+    let with_raw = StructWithRaw::read(reader.read()).unwrap();
 
     println!("RawValue data:");
     hexdump(with_raw.e.bytes());
+    println!();
 
-    let mut de = super::de::Deserializer::new_bare(io::Cursor::new(with_raw.e.bytes()), FORMAT_VERSION);
-    let inner = Vec::<Enum>::deserialize(&mut de).unwrap();
+    let mut cur = io::Cursor::new(with_raw.e.bytes());
+
+    let mut reader = super::reader::Reader::new(&mut cur);
+
+    let inner = Vec::<Enum>::read(reader.read()).unwrap();
 
     println!("Deserialized RawValue: {inner:?}\n");
 
+    if inner != data.e {
+        panic!("RAWVALUE DATA MISMATCH!");
+    }
+
     let mut re_vec = vec![];
-    let mut ser = super::ser::Serializer::new(&mut re_vec, 256).unwrap();
-    with_raw.serialize(&mut ser).unwrap();
+
+    let mut writer = super::writer::Writer::new(&mut re_vec);
+
+    with_raw.write(writer.write()).unwrap();
 
     println!("Reserialized data bytes:");
     hexdump(&re_vec);
+    println!();
 
-    let mut de = super::de::Deserializer::new(io::Cursor::new(re_vec)).unwrap();
-    let reserialized = Struct::deserialize(&mut de).unwrap();
+    let mut cur = io::Cursor::new(re_vec);
+
+    let mut reader = super::reader::Reader::new(&mut cur);
+
+    let reserialized = Struct::read(reader.read()).unwrap();
 
     println!("Reserialized data: {data:?}\n");
 
     if reserialized != data {
-        panic!("DATA MISMATCH!")
+        panic!("DATA MISMATCH!");
     }
 
-    println!("Data matches")
-
+    println!("Data matches");
 }
 
-fn test_reserialize<'de, T: Serialize + Deserialize<'de> + Eq + fmt::Debug>(data: &T) {
+fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
     println!("Data before serializing: {data:?}");
 
     let mut vec = vec![];
 
-    let mut ser = super::ser::Serializer::new(&mut vec, 256).unwrap();
+    let mut writer = super::writer::Writer::new(&mut vec);
 
-    data.serialize(&mut ser).unwrap();
+    data.write(writer.write()).unwrap();
+
+    println!();
 
     hexdump(&vec);
 
-    let mut de = super::de::Deserializer::new(io::Cursor::new(vec)).unwrap();
+    let mut cur = io::Cursor::new(vec);
 
-    let re = T::deserialize(&mut de).unwrap();
+    let mut reader = super::reader::Reader::new(&mut cur);
+
+    let re = T::read(reader.read()).unwrap();
+
+    println!();
 
     println!("Data after deserializing: {re:?}");
 
@@ -169,6 +201,9 @@ fn test_reserialize<'de, T: Serialize + Deserialize<'de> + Eq + fmt::Debug>(data
 
 fn hexdump(bytes: &[u8]) {
     for row in 0.. {
+        if row * 16 >= bytes.len() {
+            break;
+        }
 
         print!("  ");
 
@@ -176,8 +211,7 @@ fn hexdump(bytes: &[u8]) {
             let index = row * 16 + col;
             if index >= bytes.len() {
                 print!("   ");
-            }
-            else {
+            } else {
                 print!("{:02x} ", bytes[index]);
             }
 
@@ -190,8 +224,7 @@ fn hexdump(bytes: &[u8]) {
             let index = row * 16 + col;
             if index >= bytes.len() {
                 print!(" ");
-            }
-            else {
+            } else {
                 let char = char::from_u32(bytes[index] as u32);
                 let char = char.unwrap_or('.');
                 let char = if char.is_control() { '.' } else { char };
@@ -204,9 +237,5 @@ fn hexdump(bytes: &[u8]) {
         }
 
         println!();
-
-        if row * 16 >= bytes.len() {
-            break;
-        }
     }
 }

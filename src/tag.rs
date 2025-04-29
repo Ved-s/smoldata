@@ -324,21 +324,21 @@ impl TypeTag {
             TypeTag::Integer { width: _, signed: _, varint: true }
                 => &[TagParameter::Varint],
             TypeTag::Integer { width: IntWidth::W8, signed: _, varint: false }
-                => &[TagParameter::FixedIntBytes(IntWidth::W8)],
+                => &[TagParameter::ShortBytes { len: 1 }],
             TypeTag::Integer { width: IntWidth::W16, signed: _, varint: false }
-                => &[TagParameter::FixedIntBytes(IntWidth::W16)],
+                => &[TagParameter::ShortBytes { len: 2 }],
             TypeTag::Integer { width: IntWidth::W32, signed: _, varint: false }
-                => &[TagParameter::FixedIntBytes(IntWidth::W32)],
+                => &[TagParameter::ShortBytes { len: 4 }],
             TypeTag::Integer { width: IntWidth::W64, signed: _, varint: false }
-                => &[TagParameter::FixedIntBytes(IntWidth::W64)],
+                => &[TagParameter::ShortBytes { len: 8 }],
             TypeTag::Integer { width: IntWidth::W128, signed: _, varint: false }
-                => &[TagParameter::FixedIntBytes(IntWidth::W128)],
+                => &[TagParameter::ShortBytes { len: 16 }],
 
-            TypeTag::Char { varint: false } => &[TagParameter::FixedIntBytes(IntWidth::W32)],
+            TypeTag::Char { varint: false } => &[TagParameter::ShortBytes { len: 4 }],
             TypeTag::Char { varint: true } => &[TagParameter::Varint],
 
-            TypeTag::Float(FloatWidth::F32) => &[TagParameter::FixedIntBytes(IntWidth::W32)],
-            TypeTag::Float(FloatWidth::F64) => &[TagParameter::FixedIntBytes(IntWidth::W64)],
+            TypeTag::Float(FloatWidth::F32) => &[TagParameter::ShortBytes { len: 4 }],
+            TypeTag::Float(FloatWidth::F64) => &[TagParameter::ShortBytes { len: 8 }],
 
             TypeTag::Str => &[TagParameter::StringRef],
             TypeTag::StrDirect => &[TagParameter::VarintLengthPrefixedBytearray],
@@ -385,7 +385,9 @@ impl TypeTag {
 }
 
 pub enum TagParameter {
-    FixedIntBytes(IntWidth),
+    ShortBytes {
+        len: u8
+    },
     Varint,
     VarintLengthPrefixedBytearray,
     StringRef,
