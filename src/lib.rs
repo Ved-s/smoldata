@@ -29,9 +29,8 @@ use writer::ValueWriter;
 
 pub use smoldata_derive::{SmolRead, SmolReadWrite, SmolWrite};
 
-const MAGIC_HEADER: &[u8] = b"sd";
-
-const FORMAT_VERSION: u32 = 0;
+pub const MAGIC_HEADER: &[u8] = b"sd";
+pub const FORMAT_VERSION: u32 = 0;
 
 /// Write data into a writer.<br>
 /// Writer preferred to be buffered, serialization does many small writes
@@ -199,7 +198,6 @@ macro_rules! impl_write_tuple {
                 let mut tup = writer.write_tuple($len)?;
 
                 $(
-
                     self.$field.write(tup.write_value())?;
                 )*
 
