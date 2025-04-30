@@ -8,17 +8,34 @@ use std::{
 };
 
 use crate::{
-    str::SdString, tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag}, varint
+    str::SdString, tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag}, varint, MAGIC_HEADER, FORMAT_VERSION
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
 use std::{collections::BTreeSet, num::NonZeroUsize};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReaderInitError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error(transparent)]
+    VarIntRead(#[from] crate::varint::VarIntReadError),
+
+    #[error("Input stream contains invalid magic value")]
+    InvalidMagic,
+    
+    #[error("Input stream is of unsupported version {0}, max supported is {FORMAT_VERSION}")]
+    UnsupportedVersion(u32),
+}
 
 pub struct Reader<'a> {
     reader: &'a mut dyn io::Read,
 
     tag_peek: Option<TypeTag>,
     string_map: BTreeMap<u32, Arc<str>>,
+
+    format_version: u32,
 
     #[cfg(smoldata_int_dev_error_checks)]
     finish_parent_levels: BTreeSet<NonZeroUsize>,
@@ -28,11 +45,36 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(reader: &'a mut dyn io::Read) -> Self {
+
+    pub fn new(reader: &'a mut dyn io::Read) -> Result<Self, ReaderInitError> {
+
+        let mut magicbuf = [0u8; MAGIC_HEADER.len()];
+        reader.read_exact(&mut magicbuf)?;
+        if magicbuf != MAGIC_HEADER {
+            return Err(ReaderInitError::InvalidMagic);
+        }
+
+        let version = crate::varint::read_unsigned_varint(&mut *reader)?;
+
+        if version > FORMAT_VERSION {
+            return Err(ReaderInitError::UnsupportedVersion(version));
+        }
+
+        Ok(Self::new_headerless(reader, version))
+    }
+
+    /// Panics if `format_version > crate::FORMAT_VERSION`
+    #[allow(clippy::absurd_extreme_comparisons)]
+    pub fn new_headerless(reader: &'a mut dyn io::Read, format_version: u32) -> Self {
+
+        assert!(format_version <= FORMAT_VERSION);
+
         Self {
             reader,
             tag_peek: Default::default(),
             string_map: Default::default(),
+
+            format_version,
 
             #[cfg(smoldata_int_dev_error_checks)]
             finish_parent_levels: Default::default(),
@@ -251,6 +293,11 @@ impl<'rd> ReaderRef<'_, 'rd> {
     pub fn consume_peek(&mut self) -> Option<TypeTag> {
         self.reader.tag_peek.take()
     }
+
+    #[allow(unused)]
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version
+    }
 }
 
 impl DerefMut for ReaderRef<'_, '_> {
@@ -339,6 +386,23 @@ pub enum ReadError {
         name: Arc<str>,
         type_name: &'static str,
     },
+
+    #[error("Input stream contains invalid magic value")]
+    InvalidMagic,
+    
+    #[error("Input stream is of unsupported version {0}, max supported is {FORMAT_VERSION}")]
+    UnsupportedVersion(u32),
+}
+
+impl From<ReaderInitError> for ReadError {
+    fn from(value: ReaderInitError) -> Self {
+        match value {
+            ReaderInitError::Io(e) => ReadError::Io(e),
+            ReaderInitError::VarIntRead(e) => ReadError::VarIntRead(e),
+            ReaderInitError::InvalidMagic => ReadError::InvalidMagic,
+            ReaderInitError::UnsupportedVersion(v) => ReadError::UnsupportedVersion(v),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

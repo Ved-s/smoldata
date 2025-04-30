@@ -6,9 +6,7 @@ use std::{
 };
 
 use crate::{
-    str::RefArcStr,
-    tag::{FloatWidth, IntWidth, OptionTag, StructType, TypeTag},
-    varint::{self, Sign},
+    str::RefArcStr, tag::{FloatWidth, IntWidth, OptionTag, StructType, TypeTag}, varint::{self, Sign}, FORMAT_VERSION, MAGIC_HEADER
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
@@ -30,7 +28,14 @@ pub struct Writer<'a> {
 
 #[allow(unused)]
 impl<'a> Writer<'a> {
-    pub fn new(writer: &'a mut dyn io::Write) -> Self {
+
+    pub fn new(writer: &'a mut dyn io::Write) -> Result<Self, io::Error> {
+        writer.write_all(MAGIC_HEADER)?;
+        crate::varint::write_unsigned_varint(&mut *writer, FORMAT_VERSION)?;
+        Ok(Self::new_headerless(writer))
+    }
+
+    pub fn new_headerless(writer: &'a mut dyn io::Write) -> Self {
         Self {
             writer,
             string_map: Default::default(),

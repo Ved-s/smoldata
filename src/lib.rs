@@ -17,66 +17,62 @@ pub mod writer;
 
 use std::{
     any::type_name,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     hash::Hash,
     io::{self, ErrorKind},
-    ops::Deref,
+    ops::Deref, rc::Rc, sync::Arc,
 };
 
+use raw::RawValue;
 use reader::{ReadError, ReadResult, UnexpectedValueResultExt, ValueReader};
 use writer::ValueWriter;
 
 pub use smoldata_derive::{SmolRead, SmolReadWrite, SmolWrite};
 
-
-// use de::DeserializeError;
-// use ser::SerializeError;
-// use serde::{de::DeserializeOwned, Serialize};
-
-// pub use ser::Serializer;
-// pub use de::Deserializer;
-// pub use raw::RawValue;
-
 const MAGIC_HEADER: &[u8] = b"sd";
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u32 = 0;
 
-// /// Serialize data into a writer.<br>
-// /// Writer preferred to be buffered, serialization does many small writes
-// pub fn to_writer<T: Serialize, W: io::Write>(data: &T, writer: W) -> Result<(), SerializeError> {
-//     let mut ser = ser::Serializer::new(writer, 255)?;
-//     data.serialize(&mut ser)
-// }
+/// Write data into a writer.<br>
+/// Writer preferred to be buffered, serialization does many small writes
+pub fn write_into<T: SmolWrite, W: io::Write>(data: &T, mut writer: W) -> Result<(), io::Error> {
+    let mut writer = crate::writer::Writer::new(&mut writer)?;
+    data.write(writer.write())?;
+    writer.finish();
+    Ok(())
+}
 
-// /// Serialize data into a Vec of bytes.
-// pub fn to_bytes<T: Serialize>(data: &T) -> Result<Vec<u8>, SerializeError> {
-//     let mut vec = vec![];
-//     to_writer(data, &mut vec)?;
-//     Ok(vec)
-// }
+/// Write data into a Vec of bytes.
+pub fn write_into_bytes<T: SmolWrite>(data: &T) -> Result<Vec<u8>, io::Error> {
+    let mut vec = vec![];
+    write_into(data, &mut vec)?;
+    Ok(vec)
+}
 
-// /// Serialize data into a RawValue.
-// pub fn to_raw<T: Serialize>(data: &T) -> Result<RawValue, SerializeError> {
-//     RawValue::serialize_from(data)
-// }
+/// Write data into a RawValue.
+pub fn write_into_raw<T: SmolWrite>(data: &T) -> Result<RawValue, io::Error> {
+    RawValue::write_object(data)
+}
 
-// /// Deserialize data from a reader.<br>
-// /// Reader preferred to be buffered, deserialization does many small reads
-// pub fn from_reader<T: DeserializeOwned, R: io::Read>(reader: R) -> Result<T, DeserializeError> {
-//     let mut de = de::Deserializer::new(reader)?;
-//     T::deserialize(&mut de)
-// }
+/// Read data from a reader.<br>
+/// Reader preferred to be buffered, reading does many small reads
+pub fn read_from<T: SmolRead, R: io::Read>(mut reader: R) -> ReadResult<T> {
+    let mut reader = crate::reader::Reader::new(&mut reader).map_err(ReadError::from)?;
+    let obj = T::read(reader.read())?;
+    reader.finish();
+    Ok(obj)
+}
 
-// /// Deserialize data from a slice of bytes.
-// pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DeserializeError> {
-//     let cur = std::io::Cursor::new(bytes);
-//     from_reader(cur)
-// }
+/// Read data from a slice of bytes.
+pub fn read_from_bytes<T: SmolRead>(bytes: &[u8]) -> ReadResult<T> {
+    let cur = std::io::Cursor::new(bytes);
+    read_from(cur)
+}
 
-// /// Deserialize data from a RawValue.
-// pub fn from_raw<T: DeserializeOwned>(raw: &RawValue) -> Result<T, DeserializeError> {
-//     raw.deserialize_into()
-// }
+/// Read data from a RawValue.
+pub fn from_raw<T: SmolRead>(raw: &RawValue) -> ReadResult<T> {
+    raw.read_object()
+}
 
 fn copy<R: io::Read + ?Sized, W: io::Write + ?Sized, const B: usize>(
     reader: &mut R,
@@ -176,16 +172,58 @@ impl<T: SmolWrite> SmolWrite for Vec<T> {
     }
 }
 
-impl<T1: SmolWrite, T2: SmolWrite> SmolWrite for (T1, T2) {
+impl<T: SmolWrite> SmolWrite for [T] {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
-        let mut tup = writer.write_tuple(2)?;
-
-        self.0.write(tup.write_value())?;
-        self.1.write(tup.write_value())?;
-
-        Ok(())
+        let mut seq = writer.write_seq(Some(self.len()))?;
+        for i in self {
+            i.write(seq.write_value())?;
+        }
+        seq.finish()
     }
 }
+
+impl<T: SmolWrite, const N: usize> SmolWrite for [T; N] {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        let mut seq = writer.write_seq(Some(self.len()))?;
+        for i in self {
+            i.write(seq.write_value())?;
+        }
+        seq.finish()
+    }
+}
+
+macro_rules! impl_write_tuple {
+    ($len:literal, $($tname:ident $field:tt),*) => {
+        impl<$($tname: SmolWrite),*> SmolWrite for ($($tname),*) {
+            fn write(&self, writer: ValueWriter) -> io::Result<()> {
+                let mut tup = writer.write_tuple($len)?;
+
+                $(
+
+                    self.$field.write(tup.write_value())?;
+                )*
+
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_write_tuple!(2, T1 0, T2 1);
+impl_write_tuple!(3, T1 0, T2 1, T3 2);
+impl_write_tuple!(4, T1 0, T2 1, T3 2, T4 3);
+impl_write_tuple!(5, T1 0, T2 1, T3 2, T4 3, T5 4);
+impl_write_tuple!(6, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5);
+impl_write_tuple!(7, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6);
+impl_write_tuple!(8, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7);
+impl_write_tuple!(9, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8);
+impl_write_tuple!(10, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9);
+impl_write_tuple!(11, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10);
+impl_write_tuple!(12, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11);
+impl_write_tuple!(13, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12);
+impl_write_tuple!(14, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13);
+impl_write_tuple!(15, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13, T15 14);
+impl_write_tuple!(16, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13, T15 14, T16 15);
 
 impl<K: SmolWrite, V: SmolWrite, S> SmolWrite for HashMap<K, V, S> {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
@@ -199,6 +237,39 @@ impl<K: SmolWrite, V: SmolWrite, S> SmolWrite for HashMap<K, V, S> {
         }
 
         map.finish()
+    }
+}
+
+impl<K: SmolWrite, V: SmolWrite> SmolWrite for BTreeMap<K, V> {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        let mut map = writer.write_map(Some(self.len()))?;
+
+        for (k, v) in self {
+            let mut pair = map.write_pair();
+
+            k.write(pair.write_key())?;
+            v.write(pair.write_value())?;
+        }
+
+        map.finish()
+    }
+}
+
+impl<T: SmolWrite> SmolWrite for Box<T> {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        <T as SmolWrite>::write(self, writer)
+    }
+}
+
+impl<T: SmolWrite> SmolWrite for Rc<T> {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        <T as SmolWrite>::write(self, writer)
+    }
+}
+
+impl<T: SmolWrite> SmolWrite for Arc<T> {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        <T as SmolWrite>::write(self, writer)
     }
 }
 
@@ -268,43 +339,108 @@ impl<T: SmolRead> SmolRead for Vec<T> {
     }
 }
 
-impl<T1: SmolRead, T2: SmolRead> SmolRead for (T1, T2) {
+impl<T: SmolRead, const N: usize> SmolRead for [T; N] {
     fn read(reader: ValueReader) -> ReadResult<Self> {
-        let mut tuple = reader
+        let mut array = reader
             .read()?
-            .take_tuple()
+            .take_array()
             .with_type_name_of::<Self>()
             .map_err(ReadError::from)?;
 
-        let length = tuple.remaining();
-        'read: {
-            if length != 2 {
-                break 'read;
+        if let Some(rem) = array.remaining() {
+            if rem != N {
+                return Err(ReadError::UnexpectedLength {
+                    expected: N,
+                    got: rem,
+                    type_name: std::any::type_name::<Self>(),
+                }.into());
             }
-
-            let Some(reader) = tuple.read_value() else {
-                break 'read;
-            };
-
-            let v1 = T1::read(reader)?;
-
-            let Some(reader) = tuple.read_value() else {
-                break 'read;
-            };
-
-            let v2 = T2::read(reader)?;
-
-            return Ok((v1, v2));
         }
 
-        Err(ReadError::UnexpectedLength {
-            expected: 2,
-            got: length,
-            type_name: type_name::<Self>(),
+        let mut arr = std::array::from_fn(|_| None);
+        let mut i = 0;
+
+        while let Some(reader) = array.read_value()? {
+            if i >= arr.len() {
+                return Err(ReadError::UnexpectedLength {
+                    expected: N,
+                    got: i + 1,
+                    type_name: std::any::type_name::<Self>(),
+                }.into());
+            }
+            arr[i] = Some(T::read(reader)?);
+            i += 1;
         }
-        .into())
+
+        if i != N {
+            return Err(ReadError::UnexpectedLength {
+                expected: N,
+                got: i,
+                type_name: std::any::type_name::<Self>(),
+            }.into());
+        }
+
+        let arr = arr.map(|v| v.expect("sanity"));
+
+        Ok(arr)
     }
 }
+
+macro_rules! impl_read_tuple {
+    ($len:literal, $($tname:ident $field:tt),*) => {
+        impl<$($tname: SmolRead),*> SmolRead for ($($tname),*) {
+
+            #[allow(non_snake_case)]
+            fn read(reader: ValueReader) -> ReadResult<Self> {
+                let mut tuple = reader
+                    .read()?
+                    .take_tuple()
+                    .with_type_name_of::<Self>()
+                    .map_err(ReadError::from)?;
+
+                let length = tuple.remaining();
+                'read: {
+                    if length != $len {
+                        break 'read;
+                    }
+
+                    $(
+                        let Some(reader) = tuple.read_value() else {
+                            break 'read;
+                        };
+
+                        let $tname = $tname::read(reader)?;
+                    )*
+
+                    return Ok(($($tname),*));
+                }
+
+                Err(ReadError::UnexpectedLength {
+                    expected: $len,
+                    got: length,
+                    type_name: type_name::<Self>(),
+                }
+                .into())
+            }
+        }
+    };
+}
+
+impl_read_tuple!(2, T1 0, T2 1);
+impl_read_tuple!(3, T1 0, T2 1, T3 2);
+impl_read_tuple!(4, T1 0, T2 1, T3 2, T4 3);
+impl_read_tuple!(5, T1 0, T2 1, T3 2, T4 3, T5 4);
+impl_read_tuple!(6, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5);
+impl_read_tuple!(7, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6);
+impl_read_tuple!(8, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7);
+impl_read_tuple!(9, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8);
+impl_read_tuple!(10, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9);
+impl_read_tuple!(11, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10);
+impl_read_tuple!(12, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11);
+impl_read_tuple!(13, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12);
+impl_read_tuple!(14, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13);
+impl_read_tuple!(15, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13, T15 14);
+impl_read_tuple!(16, T1 0, T2 1, T3 2, T4 3, T5 4, T6 5, T7 6, T8 7, T9 8, T10 9, T11 10, T12 11, T13 12, T14 13, T15 14, T16 15);
 
 impl<K: SmolRead + Hash + Eq, V: SmolRead> SmolRead for HashMap<K, V> {
     fn read(reader: ValueReader) -> ReadResult<Self> {
@@ -326,5 +462,43 @@ impl<K: SmolRead + Hash + Eq, V: SmolRead> SmolRead for HashMap<K, V> {
         }
 
         Ok(map)
+    }
+}
+
+impl<K: SmolRead + Ord, V: SmolRead> SmolRead for BTreeMap<K, V> {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        let mut map_read = reader
+            .read()?
+            .take_map()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?;
+
+        let mut map = BTreeMap::new();
+
+        while let Some(mut pair) = map_read.read_pair()? {
+            let k = K::read(pair.read_key())?;
+            let v = V::read(pair.read_value())?;
+            map.insert(k, v);
+        }
+
+        Ok(map)
+    }
+}
+
+impl<T: SmolRead + Sized> SmolRead for Box<T> {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        <T as SmolRead>::read(reader).map(Into::into)
+    }
+}
+
+impl<T: SmolRead + Sized> SmolRead for Rc<T> {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        <T as SmolRead>::read(reader).map(Into::into)
+    }
+}
+
+impl<T: SmolRead + Sized> SmolRead for Arc<T> {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        <T as SmolRead>::read(reader).map(Into::into)
     }
 }

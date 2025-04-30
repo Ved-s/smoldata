@@ -7,7 +7,7 @@ use crate::{
     reader::{ReadError, ReadResult, ReaderRef},
     tag::{OptionTag, StructType, TagParameter, TypeTag},
     writer::WriterRef,
-    SmolRead, SmolWrite,
+    SmolRead, SmolWrite, FORMAT_VERSION,
 };
 
 /// Represents serialized object bytes
@@ -15,19 +15,37 @@ pub struct RawValue(Box<[u8]>);
 
 impl RawValue {
     /// Warning: Data does not contain header or version info, not for storing
+    /// Use `Reader::new_headerless` with `FORMAT_VERSION` version to deserialize data
     pub fn bytes(&self) -> &[u8] {
         &self.0
     }
-
+    
     /// Warning: Data does not contain header or version info, not for storing
+    /// Use `Reader::new_headerless` with `FORMAT_VERSION` version to deserialize data
     pub fn into_bytes(self) -> Box<[u8]> {
         self.0
     }
 
     /// Will error on (de)serializarion if invalid data was provided
-    /// Assumes data is of the current version of the format
+    /// Assumes headerless data of the current version of the format
     pub fn from_bytes(data: Box<[u8]>) -> Self {
         Self(data)
+    }
+
+    pub fn write_object<T: SmolWrite>(obj: &T) -> Result<Self, io::Error> {
+        let mut vec = vec![];
+        let mut writer = crate::writer::Writer::new_headerless(&mut vec);
+        obj.write(writer.write())?;
+        writer.finish();
+        Ok(Self(vec.into_boxed_slice())) 
+    }
+
+    pub fn read_object<T: SmolRead>(&self) -> ReadResult<T> {
+        let mut cur = io::Cursor::new(&self.0);
+        let mut reader = crate::reader::Reader::new_headerless(&mut cur, FORMAT_VERSION);
+        let obj = T::read(reader.read())?;
+        reader.finish();
+        Ok(obj)
     }
 }
 
@@ -67,7 +85,7 @@ impl SmolRead for RawValue {
     fn read(mut main_reader: crate::reader::ValueReader) -> crate::reader::ReadResult<Self> {
         let reader = main_reader.reader.get();
         let mut vec = vec![];
-        let mut main_writer = crate::writer::Writer::new(&mut vec);
+        let mut main_writer = crate::writer::Writer::new_headerless(&mut vec);
         let writer = main_writer.get_ref();
 
         copy_object(reader, writer)?;
@@ -81,7 +99,7 @@ impl SmolRead for RawValue {
 impl SmolWrite for RawValue {
     fn write(&self, mut main_writer: crate::writer::ValueWriter) -> io::Result<()> {
         let mut cursor = std::io::Cursor::new(&self.0);
-        let mut main_reader = crate::reader::Reader::new(&mut cursor);
+        let mut main_reader = crate::reader::Reader::new_headerless(&mut cursor, FORMAT_VERSION);
         let reader = main_reader.get_ref();
         let writer = main_writer.writer.get();
 

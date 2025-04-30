@@ -93,6 +93,8 @@ fn test_reserialize_complex() {
 #[test]
 #[cfg(feature = "raw_value")]
 fn test_raw() {
+    use crate::FORMAT_VERSION;
+
     let data = Struct {
         values: HashMap::from_iter([
             (0, "somelongstring".into()),
@@ -116,7 +118,7 @@ fn test_raw() {
 
     let mut vec = vec![];
 
-    let mut writer = super::writer::Writer::new(&mut vec);
+    let mut writer = super::writer::Writer::new(&mut vec).unwrap();
 
     data.write(writer.write()).unwrap();
 
@@ -126,7 +128,7 @@ fn test_raw() {
 
     let mut cur = io::Cursor::new(vec);
 
-    let mut reader = super::reader::Reader::new(&mut cur);
+    let mut reader = super::reader::Reader::new(&mut cur).unwrap();
 
     let with_raw = StructWithRaw::read(reader.read()).unwrap();
 
@@ -136,7 +138,7 @@ fn test_raw() {
 
     let mut cur = io::Cursor::new(with_raw.e.bytes());
 
-    let mut reader = super::reader::Reader::new(&mut cur);
+    let mut reader = super::reader::Reader::new_headerless(&mut cur, FORMAT_VERSION);
 
     let inner = Vec::<Enum>::read(reader.read()).unwrap();
 
@@ -148,7 +150,7 @@ fn test_raw() {
 
     let mut re_vec = vec![];
 
-    let mut writer = super::writer::Writer::new(&mut re_vec);
+    let mut writer = super::writer::Writer::new(&mut re_vec).unwrap();
 
     with_raw.write(writer.write()).unwrap();
 
@@ -158,7 +160,7 @@ fn test_raw() {
 
     let mut cur = io::Cursor::new(re_vec);
 
-    let mut reader = super::reader::Reader::new(&mut cur);
+    let mut reader = super::reader::Reader::new(&mut cur).unwrap();
 
     let reserialized = Struct::read(reader.read()).unwrap();
 
@@ -176,7 +178,7 @@ fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
 
     let mut vec = vec![];
 
-    let mut writer = super::writer::Writer::new(&mut vec);
+    let mut writer = super::writer::Writer::new(&mut vec).unwrap();
 
     data.write(writer.write()).unwrap();
 
@@ -186,7 +188,7 @@ fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
 
     let mut cur = io::Cursor::new(vec);
 
-    let mut reader = super::reader::Reader::new(&mut cur);
+    let mut reader = super::reader::Reader::new(&mut cur).unwrap();
 
     let re = T::read(reader.read()).unwrap();
 
