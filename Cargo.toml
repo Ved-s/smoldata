@@ -9,7 +9,7 @@ smoldata_derive = { path = "derive" }
 
 [features]
 default = [
-    "raw_value",
+    # "raw_value",
     "no_dev_error_checks_on_release"
 ]
 

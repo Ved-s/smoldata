@@ -23,6 +23,7 @@ use std::{
     ops::Deref, rc::Rc, sync::Arc,
 };
 
+#[cfg(feature = "raw_value")]
 use raw::RawValue;
 use reader::{ReadError, ReadResult, UnexpectedValueResultExt, ValueReader};
 use writer::ValueWriter;
@@ -48,6 +49,7 @@ pub fn write_into_bytes<T: SmolWrite>(data: &T) -> Result<Vec<u8>, io::Error> {
     Ok(vec)
 }
 
+#[cfg(feature = "raw_value")]
 /// Write data into a RawValue.
 pub fn write_into_raw<T: SmolWrite>(data: &T) -> Result<RawValue, io::Error> {
     RawValue::write_object(data)
@@ -68,6 +70,7 @@ pub fn read_from_bytes<T: SmolRead>(bytes: &[u8]) -> ReadResult<T> {
     read_from(cur)
 }
 
+#[cfg(feature = "raw_value")]
 /// Read data from a RawValue.
 pub fn from_raw<T: SmolRead>(raw: &RawValue) -> ReadResult<T> {
     raw.read_object()
