@@ -1,118 +1,87 @@
-use std::{io, slice};
+use std::{io, sync::Arc};
+
+use crate::{reader::{PackedI128, PackedU128, Primitive}, str::RefArcStr};
 
 define_tag! {
     #[repr(u8)]
-    #[unpack(TypeTag)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum FlatTypeTag {
+    pub enum TagType {
 
-        #[unpack(exact Unit)]
         #[doc = "(), no data"]
         Unit = 0,
 
-        #[unpack(exact Bool(false))]
         #[doc = "bool false"]
         BoolFalse = 1,
 
-        #[unpack(exact Bool(true))]
         #[doc = "bool true"]
         BoolTrue = 2,
 
-        #[unpack(
-            pack(Integer { width: IntWidth::W8, signed: false, varint: _ })
-            unpack(Integer { width: IntWidth::W8, signed: false, varint: false })
-        )]
         #[doc = "`u8`, one byte of `u8` follows"]
         U8 = 3,
 
-        #[unpack(
-            pack(Integer { width: IntWidth::W8, signed: true, varint: _ })
-            unpack(Integer { width: IntWidth::W8, signed: true, varint: false })
-        )]
         #[doc = "`i8`, one byte of `i8` follows"]
         I8 = 4,
 
-        #[unpack(exact Integer { width: IntWidth::W16, signed: false, varint: false })]
         #[doc = "`u16`, 2 bytes of Little Endian encoded `u16` follows"]
         U16 = 5,
 
-        #[unpack(exact Integer { width: IntWidth::W16, signed: true, varint: false })]
         #[doc = "`i16`, 2 bytes of Little Endian encoded `i16` follows"]
         I16 = 6,
 
-        #[unpack(exact Integer { width: IntWidth::W32, signed: false, varint: false })]
         #[doc = "`u32`, 4 bytes of Little Endian encoded `u32` follows"]
         U32 = 7,
 
-        #[unpack(exact Integer { width: IntWidth::W32, signed: true, varint: false })]
         #[doc = "`i32`, 4 bytes of Little Endian encoded `i32` follows"]
         I32 = 8,
 
-        #[unpack(exact Integer { width: IntWidth::W64, signed: false, varint: false })]
         #[doc = "`u64`, 8 bytes of Little Endian encoded `u64` follows"]
         U64 = 9,
 
-        #[unpack(exact Integer { width: IntWidth::W64, signed: true, varint: false })]
         #[doc = "`i64`, 8 bytes of Little Endian encoded `i64` follows"]
         I64 = 10,
 
-        #[unpack(exact Integer { width: IntWidth::W128, signed: false, varint: false })]
         #[doc = "`u128`, 16 bytes of Little Endian encoded `u128` follows"]
         U128 = 11,
 
-        #[unpack(exact Integer { width: IntWidth::W128, signed: true, varint: false })]
         #[doc = "`i128`, 16 bytes of Little Endian encoded `i128` follows"]
         I128 = 12,
 
-        #[unpack(exact Integer { width: IntWidth::W16, signed: false, varint: true })]
         #[doc = "`u16`, varint encoded `u16` follows"]
         U16Var = 13,
 
-        #[unpack(exact Integer { width: IntWidth::W16, signed: true, varint: true })]
         #[doc = "`i16`, varint encoded `i16` follows"]
         I16Var = 14,
 
-        #[unpack(exact Integer { width: IntWidth::W32, signed: false, varint: true })]
         #[doc = "`u32`, varint encoded `u32` follows"]
         U32Var = 15,
 
-        #[unpack(exact Integer { width: IntWidth::W32, signed: true, varint: true })]
         #[doc = "`i32`, varint encoded `i32` follows"]
         I32Var = 16,
 
-        #[unpack(exact Integer { width: IntWidth::W64, signed: false, varint: true })]
         #[doc = "`u64`, varint encoded `u64` follows"]
         U64Var = 17,
 
-        #[unpack(exact Integer { width: IntWidth::W64, signed: true, varint: true })]
         #[doc = "`i64`, varint encoded `i64` follows"]
         I64Var = 18,
 
-        #[unpack(exact Integer { width: IntWidth::W128, signed: false, varint: true })]
         #[doc = "`u128`, varint encoded `u128` follows"]
         U128Var = 19,
 
-        #[unpack(exact Integer { width: IntWidth::W128, signed: true, varint: true })]
         #[doc = "`i128`, varint encoded `i128` follows"]
         I128Var = 20,
 
-        #[unpack(exact Float(FloatWidth::F32))]
         #[doc = "`f32`, 4 bytes of Little Endian encoded IEEE 754 binary32"]
         F32 = 21,
 
-        #[unpack(exact Float(FloatWidth::F64))]
         #[doc = "`f64`, 8 bytes of Little Endian encoded IEEE 754 binary64"]
         F64 = 22,
 
-        #[unpack(exact Char { varint: false })]
         #[doc = "`char as u32`, 4 bytes of Little Endian encoded `u32` follows"]
         Char32 = 23,
 
-        #[unpack(exact Char { varint: true })]
         #[doc = "`char as u32`, varint encoded `u32` follows"]
         CharVar = 24,
 
-        #[unpack(exact Str)]
         #[doc = "Signed varint encoded `u32` id follows, depending on the sign:"]
         #[doc = ""]
         #[doc = "Positive: String id in the string map"]
@@ -124,125 +93,66 @@ define_tag! {
         #[doc = " and string data encoded as utf8 follow"]
         Str = 25,
 
-        #[unpack(exact StrDirect)]
         #[doc = "New string without caching,"]
         #[doc = " strlen as varint encoded `usize`"]
         #[doc = " and string data encoded as utf8 follow"]
         StrDirect = 26,
 
-        #[unpack(exact EmptyStr)]
         #[doc = "\"\", no data"]
         EmptyStr = 27,
 
-        #[unpack(exact Bytes)]
         #[doc = "`[u8]`, length as varint encoded `usize` and byte data follow"]
         Bytes = 28,
 
-        #[unpack(exact Option(OptionTag::None))]
         #[doc = "`Option::None`, no data"]
         None = 29,
 
-        #[unpack(exact Option(OptionTag::Some))]
         #[doc = "`Option::Some`, object follows"]
         Some = 30,
 
-        #[unpack(exact Struct(StructType::Unit))]
         #[doc = "unit struct, no data"]
         UnitStruct = 31,
 
-        #[unpack(exact EnumVariant(StructType::Unit))]
         #[doc = "unit variant, name as `Self::Str` data follows"]
         UnitVariant = 32,
 
-        #[unpack(exact Struct(StructType::Newtype))]
         #[doc = "newtype struct, object follows"]
         NewtypeStruct = 33,
 
-        #[unpack(exact EnumVariant(StructType::Newtype))]
         #[doc = "newtype variant, name as `Self::Str` data and object follow"]
         NewtypeVariant = 34,
 
-        #[unpack(exact Array { has_length: false })]
         #[doc = "`[T]`, objects follow until End tag"]
         Array = 35,
 
-        #[unpack(exact Array { has_length: true })]
         #[doc = "`[T]`, length as varint encoded usize and objects follow"]
         LenArray = 36,
 
-        #[unpack(exact Tuple)]
         #[doc = "`(T, ...)`, length as varint encoded usize and objects follow"]
         Tuple = 37,
 
-        #[unpack(exact Struct(StructType::Tuple))]
         #[doc = "tuple struct, `Self::Tuple` data follows"]
         TupleStruct = 38,
 
-        #[unpack(exact EnumVariant(StructType::Tuple))]
         #[doc = "tuple variant, name as `Self::Str` data and `Self::Tuple` data follow"]
         TupleVariant = 39,
 
-        #[unpack(exact Map { has_length: false })]
         #[doc = "`[(T, T)]`, pairs of key-value objects follow until End tag"]
         Map = 40,
 
-        #[unpack(exact Map { has_length: true })]
         #[doc = "`[(T, T)]`, length as varint encoded usize and pairs of key-value objects follow"]
         LenMap = 41,
 
-        #[unpack(exact Struct(StructType::Struct))]
         #[doc = "`[(String, T)]`, length as varint encoded `usize` and pairs of key-value strings and objects follow"]
         #[doc = ""]
         #[doc = "Strings are encoded without tags, only `Self::Str` data"]
         Struct = 42,
 
-        #[unpack(exact EnumVariant(StructType::Struct))]
         #[doc = "struct variant, name as `Self::Str` data and `Self::Struct` data follow"]
         StructVariant = 43,
 
-        #[unpack(exact End)]
         #[doc = "End marker for Seq and Map"]
         End = 255,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntWidth {
-    W8,
-    W16,
-    W32,
-    W64,
-    W128,
-}
-
-impl IntWidth {
-    pub const MAX_BYTES: usize = 16;
-
-    pub const fn bytes(self) -> usize {
-        match self {
-            IntWidth::W8 => 1,
-            IntWidth::W16 => 2,
-            IntWidth::W32 => 4,
-            IntWidth::W64 => 8,
-            IntWidth::W128 => 16,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FloatWidth {
-    F32,
-    F64,
-}
-
-impl FloatWidth {
-    pub const MAX_BYTES: usize = 8;
-
-    pub const fn bytes(self) -> usize {
-        match self {
-            FloatWidth::F32 => 4,
-            FloatWidth::F64 => 8,
-        }
     }
 }
 
@@ -269,36 +179,144 @@ pub enum StructType {
     Struct,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypeTag {
+#[derive(Clone, Copy)]
+pub enum IntegerTag {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    I128(PackedI128),
+    U128(PackedU128),
+}
+
+impl From<IntegerTag> for Primitive {
+    fn from(val: IntegerTag) -> Self {
+        match val {
+            IntegerTag::I8(v) => Self::I8(v),
+            IntegerTag::U8(v) => Self::U8(v),
+            IntegerTag::I16(v) => Self::I16(v),
+            IntegerTag::U16(v) => Self::U16(v),
+            IntegerTag::I32(v) => Self::I32(v),
+            IntegerTag::U32(v) => Self::U32(v),
+            IntegerTag::I64(v) => Self::I64(v),
+            IntegerTag::U64(v) => Self::U64(v),
+            IntegerTag::I128(v) => Self::I128(v),
+            IntegerTag::U128(v) => Self::U128(v),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum StructTag {
+    Unit,
+
+    /// object follows
+    Newtype,
+
+    /// `len` objects follow
+    Tuple {
+        len: usize,
+    },
+
+    /// `len` pairs of key-value strings and objects follow
+    /// 
+    /// Strings are encoded without tags
+    Struct {
+        len: usize,
+    }
+}
+
+impl StructTag {
+    pub const fn has_more_data(&self) -> bool {
+        match self {
+            StructTag::Unit => false,
+            StructTag::Newtype => true,
+            StructTag::Tuple { len } => *len > 0,
+            StructTag::Struct { len } => *len > 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum Tag<'a> {
     Unit,
     Bool(bool),
-    Integer {
-        width: IntWidth,
-        signed: bool,
+    Integer(IntegerTag),
+    F32(f32),
+    F64(f64),
+    Char(char),
 
-        #[doc = "Ignored for n8"]
-        varint: bool,
+    Str(RefArcStr<'a>),
+
+    /// `len` bytes of utf-8 encoded string data follow
+    StrDirect {
+        len: usize
     },
-    Char {
-        varint: bool,
-    },
-    Float(FloatWidth),
-    Str,
-    StrDirect,
     EmptyStr,
-    Bytes,
+
+    /// `len` bytes of data follow
+    Bytes {
+        len: usize,
+    },
+
+    /// on Some, an object follows
     Option(OptionTag),
-    Struct(StructType),
-    EnumVariant(StructType),
+
+    /// See [`StructTag`] for following data
+    Struct(StructTag),
+    
+    /// See [`StructTag`] for following data
+    Variant {
+        name: Arc<str>,
+        ty: StructTag
+    },
+
+    /// when `len: Some(len)`, `len` objects follow,
+    /// otherwise, objects follow until End tag
     Array {
-        has_length: bool,
+        len: Option<usize>
     },
-    Tuple,
+
+    /// when `len: Some(len)`, `len` pairs of objects follow,
+    /// otherwise, pairs of objects follow until End tag
     Map {
-        has_length: bool,
+        len: Option<usize>
     },
-    End,
+
+    /// `len` objects follow,
+    Tuple {
+        len: usize
+    }
+}
+
+impl Tag<'_> {
+    pub const fn has_more_data(&self) -> bool {
+        match self {
+            Tag::Unit => false,
+            Tag::Bool(_) => false,
+            Tag::Integer(_) => false,
+            Tag::F32(_) => false,
+            Tag::F64(_) => false,
+            Tag::Char(_) => false,
+            Tag::Str(_) => false,
+            Tag::StrDirect { len } => *len > 0,
+            Tag::EmptyStr => false,
+            Tag::Bytes { len } => *len > 0,
+            Tag::Option(OptionTag::None) => false,
+            Tag::Option(OptionTag::Some) => true,
+            Tag::Struct(tag) => tag.has_more_data(),
+            Tag::Variant { name: _, ty } => ty.has_more_data(),
+            Tag::Array { len: None } => true,
+            Tag::Array { len: Some(len) } => *len > 0,
+            Tag::Map { len: None } => true,
+            Tag::Map { len: Some(len) } => *len > 0,
+            Tag::Tuple { len } => *len > 0,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -314,81 +332,81 @@ pub enum TagReadError {
 #[error("Invalid tag value {0}")]
 pub struct InvalidTagError(u8);
 
-impl TypeTag {
-    #[rustfmt::skip]
-    pub const fn tag_params(self) -> &'static [TagParameter] {
-        match self {
-            TypeTag::Unit => &[],
-            TypeTag::Bool(_) => &[],
+// impl TypeTag {
+//     #[rustfmt::skip]
+//     pub const fn tag_params(self) -> &'static [TagParameter] {
+//         match self {
+//             TypeTag::Unit => &[],
+//             TypeTag::Bool(_) => &[],
 
-            TypeTag::Integer { width: _, signed: _, varint: true }
-                => &[TagParameter::Varint],
-            TypeTag::Integer { width: IntWidth::W8, signed: _, varint: false }
-                => &[TagParameter::ShortBytes { len: 1 }],
-            TypeTag::Integer { width: IntWidth::W16, signed: _, varint: false }
-                => &[TagParameter::ShortBytes { len: 2 }],
-            TypeTag::Integer { width: IntWidth::W32, signed: _, varint: false }
-                => &[TagParameter::ShortBytes { len: 4 }],
-            TypeTag::Integer { width: IntWidth::W64, signed: _, varint: false }
-                => &[TagParameter::ShortBytes { len: 8 }],
-            TypeTag::Integer { width: IntWidth::W128, signed: _, varint: false }
-                => &[TagParameter::ShortBytes { len: 16 }],
+//             TypeTag::Integer { width: _, signed: _, varint: true }
+//                 => &[TagParameter::Varint],
+//             TypeTag::Integer { width: IntWidth::W8, signed: _, varint: false }
+//                 => &[TagParameter::ShortBytes { len: 1 }],
+//             TypeTag::Integer { width: IntWidth::W16, signed: _, varint: false }
+//                 => &[TagParameter::ShortBytes { len: 2 }],
+//             TypeTag::Integer { width: IntWidth::W32, signed: _, varint: false }
+//                 => &[TagParameter::ShortBytes { len: 4 }],
+//             TypeTag::Integer { width: IntWidth::W64, signed: _, varint: false }
+//                 => &[TagParameter::ShortBytes { len: 8 }],
+//             TypeTag::Integer { width: IntWidth::W128, signed: _, varint: false }
+//                 => &[TagParameter::ShortBytes { len: 16 }],
 
-            TypeTag::Char { varint: false } => &[TagParameter::ShortBytes { len: 4 }],
-            TypeTag::Char { varint: true } => &[TagParameter::Varint],
+//             TypeTag::Char { varint: false } => &[TagParameter::ShortBytes { len: 4 }],
+//             TypeTag::Char { varint: true } => &[TagParameter::Varint],
 
-            TypeTag::Float(FloatWidth::F32) => &[TagParameter::ShortBytes { len: 4 }],
-            TypeTag::Float(FloatWidth::F64) => &[TagParameter::ShortBytes { len: 8 }],
+//             TypeTag::Float(FloatWidth::F32) => &[TagParameter::ShortBytes { len: 4 }],
+//             TypeTag::Float(FloatWidth::F64) => &[TagParameter::ShortBytes { len: 8 }],
 
-            TypeTag::Str => &[TagParameter::StringRef],
-            TypeTag::StrDirect => &[TagParameter::VarintLengthPrefixedBytearray],
-            TypeTag::EmptyStr => &[],
+//             TypeTag::Str => &[TagParameter::StringRef],
+//             TypeTag::StrDirect => &[TagParameter::VarintLengthPrefixedBytearray],
+//             TypeTag::EmptyStr => &[],
 
-            TypeTag::Bytes => &[TagParameter::VarintLengthPrefixedBytearray],
-            TypeTag::Option(OptionTag::None) => &[],
-            TypeTag::Option(OptionTag::Some) => &[],
+//             TypeTag::Bytes => &[TagParameter::VarintLengthPrefixedBytearray],
+//             TypeTag::Option(OptionTag::None) => &[],
+//             TypeTag::Option(OptionTag::Some) => &[],
 
-            TypeTag::Struct(StructType::Unit) => &[],
-            TypeTag::Struct(StructType::Newtype) => &[],
-            TypeTag::Struct(StructType::Tuple) => &[TagParameter::Varint],
-            TypeTag::Struct(StructType::Struct) => &[TagParameter::Varint],
+//             TypeTag::Struct(StructType::Unit) => &[],
+//             TypeTag::Struct(StructType::Newtype) => &[],
+//             TypeTag::Struct(StructType::Tuple) => &[TagParameter::Varint],
+//             TypeTag::Struct(StructType::Struct) => &[TagParameter::Varint],
 
-            TypeTag::EnumVariant(StructType::Unit)
-                => &[TagParameter::StringRef],
-            TypeTag::EnumVariant(StructType::Newtype)
-                => &[TagParameter::StringRef],
-            TypeTag::EnumVariant(StructType::Tuple)
-                => &[TagParameter::StringRef, TagParameter::Varint],
-            TypeTag::EnumVariant(StructType::Struct)
-                => &[TagParameter::StringRef, TagParameter::Varint],
+//             TypeTag::EnumVariant(StructType::Unit)
+//                 => &[TagParameter::StringRef],
+//             TypeTag::EnumVariant(StructType::Newtype)
+//                 => &[TagParameter::StringRef],
+//             TypeTag::EnumVariant(StructType::Tuple)
+//                 => &[TagParameter::StringRef, TagParameter::Varint],
+//             TypeTag::EnumVariant(StructType::Struct)
+//                 => &[TagParameter::StringRef, TagParameter::Varint],
 
-            TypeTag::Array { has_length: true } => &[TagParameter::Varint],
-            TypeTag::Array { has_length: false } => &[],
-            TypeTag::Tuple => &[TagParameter::Varint],
-            TypeTag::Map { has_length: true } => &[TagParameter::Varint],
-            TypeTag::Map { has_length: false } => &[],
-            TypeTag::End => &[],
-        }
-    }
+//             TypeTag::Array { has_length: true } => &[TagParameter::Varint],
+//             TypeTag::Array { has_length: false } => &[],
+//             TypeTag::Tuple => &[TagParameter::Varint],
+//             TypeTag::Map { has_length: true } => &[TagParameter::Varint],
+//             TypeTag::Map { has_length: false } => &[],
+//             TypeTag::End => &[],
+//         }
+//     }
 
-    pub fn write<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&[self.pack().into()])
-    }
+//     pub fn write<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+//         writer.write_all(&[self.pack().into()])
+//     }
 
-    pub fn read<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, TagReadError> {
-        let mut byte = 0u8;
-        reader.read_exact(slice::from_mut(&mut byte))?;
-        let packed = FlatTypeTag::try_from(byte)
-            .map_err(|v| TagReadError::InvalidTagError(InvalidTagError(v)))?;
-        Ok(packed.into())
-    }
-}
+//     pub fn read<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, TagReadError> {
+//         let mut byte = 0u8;
+//         reader.read_exact(slice::from_mut(&mut byte))?;
+//         let packed = FlatTypeTag::try_from(byte)
+//             .map_err(|v| TagReadError::InvalidTagError(InvalidTagError(v)))?;
+//         Ok(packed.into())
+//     }
+// }
 
-pub enum TagParameter {
-    ShortBytes {
-        len: u8
-    },
-    Varint,
-    VarintLengthPrefixedBytearray,
-    StringRef,
-}
+// pub enum TagParameter {
+//     ShortBytes {
+//         len: u8
+//     },
+//     Varint,
+//     VarintLengthPrefixedBytearray,
+//     StringRef,
+// }

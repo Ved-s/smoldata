@@ -1,5 +1,6 @@
 use std::{ops::Deref, sync::Arc};
 
+#[derive(Clone)]
 pub enum RefArcStr<'a> {
     Arc(Arc<str>),
     Str(&'a str),

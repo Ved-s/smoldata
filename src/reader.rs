@@ -8,7 +8,9 @@ use std::{
 };
 
 use crate::{
-    str::SdString, tag::{FloatWidth, IntWidth, OptionTag, StructType, TagReadError, TypeTag}, varint, MAGIC_HEADER, FORMAT_VERSION
+    str::{RefArcStr, SdString},
+    tag::{IntegerTag, OptionTag, StructTag, StructType, Tag, TagType},
+    varint, FORMAT_VERSION, MAGIC_HEADER,
 };
 
 #[cfg(smoldata_int_dev_error_checks)]
@@ -24,15 +26,21 @@ pub enum ReaderInitError {
 
     #[error("Input stream contains invalid magic value")]
     InvalidMagic,
-    
+
     #[error("Input stream is of unsupported version {0}, max supported is {FORMAT_VERSION}")]
     UnsupportedVersion(u32),
+}
+
+#[derive(Clone)]
+pub enum TagOrEnd {
+    Tag(Tag<'static>),
+    End,
 }
 
 pub struct Reader<'a> {
     reader: &'a mut dyn io::Read,
 
-    tag_peek: Option<TypeTag>,
+    tag_peek: Option<TagOrEnd>,
     string_map: BTreeMap<u32, Arc<str>>,
 
     format_version: u32,
@@ -45,9 +53,7 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-
     pub fn new(reader: &'a mut dyn io::Read) -> Result<Self, ReaderInitError> {
-
         let mut magicbuf = [0u8; MAGIC_HEADER.len()];
         reader.read_exact(&mut magicbuf)?;
         if magicbuf != MAGIC_HEADER {
@@ -66,7 +72,6 @@ impl<'a> Reader<'a> {
     /// Panics if `format_version > crate::FORMAT_VERSION`
     #[allow(clippy::absurd_extreme_comparisons)]
     pub fn new_headerless(reader: &'a mut dyn io::Read, format_version: u32) -> Self {
-
         assert!(format_version <= FORMAT_VERSION);
 
         Self {
@@ -113,10 +118,260 @@ impl<'a> Reader<'a> {
 
         self.reader
     }
-    
+
     #[allow(unused)]
     pub(crate) fn get_ref(&mut self) -> ReaderRef<'_, 'a> {
         ReaderRef { reader: self }
+    }
+
+    fn read_tag_or_end(&mut self) -> ReadResult<TagOrEnd> {
+        let mut tag_byte = 0u8;
+        self.reader
+            .read_exact(std::slice::from_mut(&mut tag_byte))
+            .map_err(ReadError::from)?;
+        let tag = match TagType::try_from(tag_byte) {
+            Ok(t) => t,
+            Err(v) => {
+                // todo: reserved tags
+                return Err(ReadError::InvalidTag(v).into());
+            }
+        };
+
+        Ok(TagOrEnd::Tag(match tag {
+            TagType::Unit => Tag::Unit,
+            TagType::BoolFalse => Tag::Bool(false),
+            TagType::BoolTrue => Tag::Bool(true),
+            TagType::U8 => {
+                let mut v = [0u8; 1];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::U8(v[0]))
+            }
+            TagType::I8 => {
+                let mut v = [0u8; 1];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::I8(v[0] as i8))
+            }
+            TagType::U16 => {
+                let mut v = [0u8; 2];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::U16(u16::from_le_bytes(v)))
+            }
+            TagType::I16 => {
+                let mut v = [0u8; 2];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::I16(i16::from_le_bytes(v)))
+            }
+            TagType::U32 => {
+                let mut v = [0u8; 4];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::U32(u32::from_le_bytes(v)))
+            }
+            TagType::I32 => {
+                let mut v = [0u8; 4];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::I32(i32::from_le_bytes(v)))
+            }
+            TagType::U64 => {
+                let mut v = [0u8; 8];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::U64(u64::from_le_bytes(v)))
+            }
+            TagType::I64 => {
+                let mut v = [0u8; 8];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::I64(i64::from_le_bytes(v)))
+            }
+            TagType::U128 => {
+                let mut v = [0u8; 16];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::U128(u128::from_le_bytes(v).into()))
+            }
+            TagType::I128 => {
+                let mut v = [0u8; 16];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::Integer(IntegerTag::I128(i128::from_le_bytes(v).into()))
+            }
+            TagType::U16Var => Tag::Integer(IntegerTag::U16(
+                varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::I16Var => Tag::Integer(IntegerTag::I16(
+                varint::read_signed_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::U32Var => Tag::Integer(IntegerTag::U32(
+                varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::I32Var => Tag::Integer(IntegerTag::I32(
+                varint::read_signed_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::U64Var => Tag::Integer(IntegerTag::U64(
+                varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::I64Var => Tag::Integer(IntegerTag::I64(
+                varint::read_signed_varint(&mut *self.reader).map_err(ReadError::from)?,
+            )),
+            TagType::U128Var => Tag::Integer(IntegerTag::U128(PackedU128(
+                varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            ))),
+            TagType::I128Var => Tag::Integer(IntegerTag::I128(PackedI128(
+                varint::read_signed_varint(&mut *self.reader).map_err(ReadError::from)?,
+            ))),
+            TagType::F32 => {
+                let mut v = [0u8; 4];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::F32(f32::from_le_bytes(v))
+            }
+            TagType::F64 => {
+                let mut v = [0u8; 8];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                Tag::F64(f64::from_le_bytes(v))
+            }
+            TagType::Char32 => {
+                let mut v = [0u8; 4];
+                self.reader.read_exact(&mut v).map_err(ReadError::from)?;
+                match char::from_u32(u32::from_le_bytes(v)) {
+                    Some(c) => Tag::Char(c),
+                    None => return Err(ReadError::InvalidChar(u32::from_le_bytes(v)).into()),
+                }
+            }
+            TagType::CharVar => {
+                let v = varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
+                match char::from_u32(v) {
+                    Some(c) => Tag::Char(c),
+                    None => return Err(ReadError::InvalidChar(v).into()),
+                }
+            }
+            TagType::Str => Tag::Str(RefArcStr::Arc(self.read_str_inner()?)),
+            TagType::StrDirect => Tag::StrDirect {
+                len: varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            },
+            TagType::EmptyStr => Tag::EmptyStr,
+            TagType::Bytes => Tag::Bytes {
+                len: varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            },
+            TagType::None => Tag::Option(OptionTag::None),
+            TagType::Some => Tag::Option(OptionTag::Some),
+            TagType::UnitStruct => Tag::Struct(StructTag::Unit),
+            TagType::UnitVariant => Tag::Variant {
+                name: self.read_str_inner()?,
+                ty: StructTag::Unit,
+            },
+            TagType::NewtypeStruct => Tag::Struct(StructTag::Newtype),
+            TagType::NewtypeVariant => Tag::Variant {
+                name: self.read_str_inner()?,
+                ty: StructTag::Newtype,
+            },
+            TagType::Array => Tag::Array { len: None },
+            TagType::LenArray => Tag::Array {
+                len: Some(
+                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+                ),
+            },
+            TagType::Tuple => Tag::Tuple {
+                len: varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            },
+            TagType::TupleStruct => Tag::Struct(StructTag::Tuple {
+                len: varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            }),
+            TagType::TupleVariant => {
+                let name = self.read_str_inner()?;
+                let len =
+                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
+                Tag::Variant {
+                    name,
+                    ty: StructTag::Tuple { len },
+                }
+            }
+            TagType::Map => Tag::Map { len: None },
+            TagType::LenMap => Tag::Map {
+                len: Some(
+                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+                ),
+            },
+            TagType::Struct => Tag::Struct(StructTag::Struct {
+                len: varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?,
+            }),
+            TagType::StructVariant => {
+                let name = self.read_str_inner()?;
+                let len =
+                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
+                Tag::Variant {
+                    name,
+                    ty: StructTag::Struct { len },
+                }
+            }
+            TagType::End => return Ok(TagOrEnd::End),
+        }))
+    }
+
+    fn read_tag_inner(&mut self) -> ReadResult<Tag<'static>> {
+        if let Some(tag) = self.tag_peek.take() {
+            return match tag {
+                TagOrEnd::Tag(tag) => Ok(tag),
+                TagOrEnd::End => Err(ReadError::UnexpectedEnd.into()),
+            };
+        }
+
+        match self.read_tag_or_end()? {
+            TagOrEnd::Tag(tag) => Ok(tag),
+            TagOrEnd::End => Err(ReadError::UnexpectedEnd.into()),
+        }
+    }
+
+    fn peek_tag_inner(&mut self) -> ReadResult<&Tag<'static>> {
+        if self.tag_peek.is_none() {
+            self.tag_peek = Some(self.read_tag_or_end()?);
+        }
+
+        match &self.tag_peek {
+            Some(TagOrEnd::End) => Err(ReadError::UnexpectedEnd.into()),
+            Some(TagOrEnd::Tag(tag)) => Ok(tag),
+            None => unreachable!(),
+        }
+    }
+
+    fn read_seq_end_inner(&mut self) -> ReadResult<bool> {
+        if self.tag_peek.is_none() {
+            self.tag_peek = Some(self.read_tag_or_end()?);
+        }
+
+        let end = self
+            .tag_peek
+            .as_ref()
+            .is_some_and(|v| matches!(v, TagOrEnd::End));
+
+        if end {
+            self.tag_peek.take();
+        }
+
+        Ok(end)
+    }
+
+    fn read_str_inner(&mut self) -> ReadResult<Arc<str>> {
+        let (index, sign) =
+            varint::read_varint_with_sign(&mut *self.reader).map_err(ReadError::from)?;
+
+        Ok(match sign {
+            varint::Sign::Positive => {
+                let Some(str) = self.string_map.get(&index) else {
+                    return Err(Box::new(ReadError::InvalidStringReference(index)));
+                };
+
+                str.clone()
+            }
+            varint::Sign::Negative => {
+                let length =
+                    varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
+                let mut data = vec![0u8; length];
+                self.reader.read_exact(&mut data).map_err(ReadError::from)?;
+
+                let str = String::from_utf8(data).map_err(|_| ReadError::InvalidString)?;
+                let arc: Arc<str> = str.into();
+
+                self.string_map.insert(index, arc.clone());
+
+                arc
+            }
+        })
     }
 }
 
@@ -230,54 +485,20 @@ pub(crate) struct ReaderRef<'rf, 'rd> {
 
 #[allow(unused)]
 impl<'rd> ReaderRef<'_, 'rd> {
-    pub fn read_tag(&mut self) -> ReadResult<TypeTag> {
-        if let Some(tag) = self.reader.tag_peek.take() {
-            return Ok(tag);
-        }
-
-        let tag = TypeTag::read(&mut self.reader.reader).map_err(ReadError::from)?;
-        Ok(tag)
+    pub fn read_tag(&mut self) -> ReadResult<Tag> {
+        self.reader.read_tag_inner()
     }
 
-    pub fn peek_tag(&mut self) -> ReadResult<TypeTag> {
-        if let Some(tag) = self.reader.tag_peek {
-            return Ok(tag);
-        }
+    pub fn peek_tag(&mut self) -> ReadResult<&Tag> {
+        self.reader.peek_tag_inner()
+    }
 
-        let tag = TypeTag::read(&mut self.reader.reader).map_err(ReadError::from)?;
-        self.reader.tag_peek = Some(tag);
-        Ok(tag)
+    pub fn read_seq_end(&mut self) -> ReadResult<bool> {
+        self.reader.read_seq_end_inner()
     }
 
     pub fn read_str(&mut self) -> ReadResult<Arc<str>> {
-        let (index, sign) =
-            varint::read_varint_with_sign(&mut *self.reader.reader).map_err(ReadError::from)?;
-
-        Ok(match sign {
-            varint::Sign::Positive => {
-                let Some(str) = self.reader.string_map.get(&index) else {
-                    return Err(Box::new(ReadError::InvalidStringReference(index)));
-                };
-
-                str.clone()
-            }
-            varint::Sign::Negative => {
-                let length = varint::read_unsigned_varint(&mut *self.reader.reader)
-                    .map_err(ReadError::from)?;
-                let mut data = vec![0u8; length];
-                self.reader
-                    .reader
-                    .read_exact(&mut data)
-                    .map_err(ReadError::from)?;
-
-                let str = String::from_utf8(data).map_err(|_| ReadError::InvalidString)?;
-                let arc: Arc<str> = str.into();
-
-                self.reader.string_map.insert(index, arc.clone());
-
-                arc
-            }
-        })
+        self.reader.read_str_inner()
     }
 
     pub fn inner(&mut self) -> &mut dyn io::Read {
@@ -288,10 +509,6 @@ impl<'rd> ReaderRef<'_, 'rd> {
         ReaderRef {
             reader: self.reader,
         }
-    }
-    
-    pub fn consume_peek(&mut self) -> Option<TypeTag> {
-        self.reader.tag_peek.take()
     }
 
     #[allow(unused)]
@@ -319,14 +536,10 @@ pub enum ReadError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    #[error("Reading tag")]
-    TagRead(
-        #[from]
-        #[source]
-        TagReadError,
-    ),
+    #[error("Read invalid tag {0}")]
+    InvalidTag(u8),
 
-    #[error("Reading tag")]
+    #[error("Reading varint")]
     VarIntRead(
         #[from]
         #[source]
@@ -389,7 +602,7 @@ pub enum ReadError {
 
     #[error("Input stream contains invalid magic value")]
     InvalidMagic,
-    
+
     #[error("Input stream is of unsupported version {0}, max supported is {FORMAT_VERSION}")]
     UnsupportedVersion(u32),
 }
@@ -693,8 +906,8 @@ pub enum PrimitiveType {
 }
 
 enum StringReaderType {
-    Str,
-    Direct,
+    Str(Arc<str>),
+    Direct(usize),
     Empty,
 }
 
@@ -708,11 +921,9 @@ impl StringReader<'_, '_> {
     pub fn read(mut self) -> ReadResult<SdString> {
         let mut reader = self.reader.get();
         let str = match self.ty {
-            StringReaderType::Str => SdString::Arc(reader.read_str()?),
-            StringReaderType::Direct => {
-                let length =
-                    varint::read_unsigned_varint(reader.inner()).map_err(ReadError::from)?;
-                let mut data = vec![0u8; length];
+            StringReaderType::Str(a) => SdString::Arc(a),
+            StringReaderType::Direct(len) => {
+                let mut data = vec![0u8; len];
                 reader
                     .inner()
                     .read_exact(&mut data)
@@ -733,6 +944,7 @@ impl StringReader<'_, '_> {
 
 pub struct BytesReader<'rf, 'rd> {
     reader: ReaderLevel<'rf, 'rd>,
+    len: usize,
 }
 
 impl BytesReader<'_, '_> {
@@ -740,15 +952,13 @@ impl BytesReader<'_, '_> {
     pub fn read_into(mut self, buf: &mut Vec<u8>) -> ReadResult<usize> {
         let mut reader = self.reader.get();
 
-        let length = varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-
-        buf.reserve(length);
-        crate::copy::<_, _, 1024>(reader.deref_mut(), buf, Some(length))
+        buf.reserve(self.len);
+        crate::copy::<_, _, 1024>(reader.deref_mut(), buf, Some(self.len))
             .map_err(ReadError::from)?;
 
         self.reader.finish();
 
-        Ok(length)
+        Ok(self.len)
     }
 
     #[track_caller]
@@ -943,56 +1153,57 @@ impl<'rf, 'rd> StructReading<'rf, 'rd> {
     }
 }
 
+
+
 pub struct EnumReading<'rf, 'rd> {
     reader: ReaderLevel<'rf, 'rd>,
-    ty: StructType,
+    name: Arc<str>,
+    ty: StructTag,
 }
 
 impl<'rf, 'rd> EnumReading<'rf, 'rd> {
     #[track_caller]
     pub fn read_variant(mut self) -> ReadResult<(Arc<str>, StructReading<'rf, 'rd>)> {
-        let mut reader = self.reader.get();
-        let name = reader.read_str()?;
-
         let reader = match self.ty {
-            StructType::Unit => {
+            StructTag::Unit => {
                 self.reader.finish();
                 StructReading::Unit
             }
-            StructType::Newtype => StructReading::Newtype(ValueReader {
+            StructTag::Newtype => StructReading::Newtype(ValueReader {
                 reader: self.reader,
             }),
-            StructType::Tuple => {
-                let length =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                if length == 0 {
+            StructTag::Tuple { len } => {
+                if len == 0 {
                     self.reader.finish();
                 }
 
                 StructReading::Tuple(TupleReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 })
             }
-            StructType::Struct => {
-                let length =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                if length == 0 {
+            StructTag::Struct { len } => {
+                if len == 0 {
                     self.reader.finish();
                 }
 
                 StructReading::Struct(StructReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 })
             }
         };
 
-        Ok((name, reader))
+        Ok((self.name, reader))
     }
 
     pub fn ty(&self) -> StructType {
-        self.ty
+        match &self.ty {
+            StructTag::Unit => StructType::Unit,
+            StructTag::Newtype => StructType::Newtype,
+            StructTag::Tuple { .. } => StructType::Tuple,
+            StructTag::Struct { .. } => StructType::Struct,
+        }
     }
 }
 
@@ -1227,8 +1438,7 @@ impl<'rd> ArrayReader<'_, 'rd> {
 
         let mut reader = self.reader.get();
 
-        if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
-            reader.read_tag()?;
+        if self.remaining.is_none() && reader.read_seq_end()? {
             self.remaining = Some(0);
             self.reader.finish();
             return Ok(None);
@@ -1266,8 +1476,7 @@ impl<'rd> MapReader<'_, 'rd> {
 
         let mut reader = self.reader.get();
 
-        if self.remaining.is_none() && matches!(reader.peek_tag()?, TypeTag::End) {
-            reader.read_tag()?;
+        if self.remaining.is_none() && reader.read_seq_end()? {
             self.remaining = Some(0);
             self.reader.finish();
             return Ok(None);
@@ -1329,203 +1538,109 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
     pub fn read(mut self) -> ReadResult<ValueReading<'rf, 'rd>> {
         let mut reader = self.reader.get();
         Ok(match reader.read_tag()? {
-            TypeTag::Unit => {
+            Tag::Unit => {
                 self.reader.finish();
                 ValueReading::Primitive(Primitive::Unit)
             }
-            TypeTag::Bool(b) => {
+            Tag::Bool(b) => {
                 self.reader.finish();
                 ValueReading::Primitive(Primitive::Bool(b))
             }
-            TypeTag::Integer {
-                width,
-                signed,
-                varint,
-            } => {
-                let v = Self::read_integer(reader, width, signed, varint)?;
+            Tag::Integer(int) => {
                 self.reader.finish();
-                ValueReading::Primitive(v)
-            }
-            TypeTag::Char { varint: true } => {
-                let val =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                let char = char::from_u32(val).ok_or(ReadError::InvalidChar(val))?;
+                ValueReading::Primitive(int.into())
+            },
+            Tag::Char(c) => {
                 self.reader.finish();
-                ValueReading::Primitive(Primitive::Char(char))
+                ValueReading::Primitive(Primitive::Char(c))
             }
-            TypeTag::Char { varint: false } => {
-                let mut buf = [0u8; 4];
-                reader
-                    .inner()
-                    .read_exact(&mut buf)
-                    .map_err(ReadError::from)?;
-                let val = u32::from_le_bytes(buf);
-                let char = char::from_u32(val).ok_or(ReadError::InvalidChar(val))?;
+            Tag::F32(v) => {
                 self.reader.finish();
-                ValueReading::Primitive(Primitive::Char(char))
+                ValueReading::Primitive(Primitive::F32(v))
             }
-            TypeTag::Float(FloatWidth::F32) => {
-                let mut buf = [0u8; 4];
-                reader
-                    .inner()
-                    .read_exact(&mut buf)
-                    .map_err(ReadError::from)?;
-                let val = f32::from_le_bytes(buf);
+            Tag::F64(v) => {
                 self.reader.finish();
-                ValueReading::Primitive(Primitive::F32(val))
+                ValueReading::Primitive(Primitive::F64(v))
             }
-            TypeTag::Float(FloatWidth::F64) => {
-                let mut buf = [0u8; 8];
-                reader
-                    .inner()
-                    .read_exact(&mut buf)
-                    .map_err(ReadError::from)?;
-                let val = f64::from_le_bytes(buf);
-                self.reader.finish();
-                ValueReading::Primitive(Primitive::F64(val))
-            }
-            TypeTag::Str => ValueReading::String(StringReader {
+            Tag::Str(s) => ValueReading::String(StringReader {
+                ty: StringReaderType::Str(s.into()),
                 reader: self.reader,
-                ty: StringReaderType::Str,
             }),
-            TypeTag::StrDirect => ValueReading::String(StringReader {
+            Tag::StrDirect { len } => ValueReading::String(StringReader {
                 reader: self.reader,
-                ty: StringReaderType::Direct,
+                ty: StringReaderType::Direct(len),
             }),
-            TypeTag::EmptyStr => ValueReading::String(StringReader {
+            Tag::EmptyStr => ValueReading::String(StringReader {
                 reader: self.reader,
                 ty: StringReaderType::Empty,
             }),
-            TypeTag::Bytes => ValueReading::Bytes(BytesReader {
+            Tag::Bytes { len } => ValueReading::Bytes(BytesReader {
                 reader: self.reader,
+                len
             }),
-            TypeTag::Option(OptionTag::None) => {
+            Tag::Option(OptionTag::None) => {
                 self.reader.finish();
                 ValueReading::Option(None)
             }
-            TypeTag::Option(OptionTag::Some) => ValueReading::Option(Some(self)),
-            TypeTag::Struct(StructType::Unit) => {
+            Tag::Option(OptionTag::Some) => ValueReading::Option(Some(self)),
+            Tag::Struct(StructTag::Unit) => {
                 self.reader.finish();
                 ValueReading::Struct(StructReading::Unit)
             }
-            TypeTag::Struct(StructType::Newtype) => {
+            Tag::Struct(StructTag::Newtype) => {
                 ValueReading::Struct(StructReading::Newtype(ValueReader {
                     reader: self.reader,
                 }))
             }
-            TypeTag::Struct(StructType::Tuple) => {
-                let length =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                if length == 0 {
+            Tag::Struct(StructTag::Tuple { len }) => {
+                if len == 0 {
                     self.reader.finish();
                 }
                 ValueReading::Struct(StructReading::Tuple(TupleReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 }))
             }
-            TypeTag::Struct(StructType::Struct) => {
-                let length =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                if length == 0 {
+            Tag::Struct(StructTag::Struct { len }) => {
+                if len == 0 {
                     self.reader.finish();
                 }
                 ValueReading::Struct(StructReading::Struct(StructReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 }))
             }
-            TypeTag::EnumVariant(ty) => ValueReading::Enum(EnumReading {
-                ty,
+            Tag::Variant { name, ty } => ValueReading::Enum(EnumReading {
                 reader: self.reader,
+                name,
+                ty,
             }),
-            TypeTag::Array { has_length } => {
-                let length = has_length
-                    .then(|| {
-                        varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)
-                    })
-                    .transpose()?;
-                if length == Some(0) {
+            Tag::Array { len } => {
+                if len== Some(0) {
                     self.reader.finish();
                 }
                 ValueReading::Array(ArrayReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 })
             }
-            TypeTag::Tuple => {
-                let length =
-                    varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-                if length == 0 {
+            Tag::Tuple { len } => {
+                if len == 0 {
                     self.reader.finish();
                 }
                 ValueReading::Tuple(TupleReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 })
             }
-            TypeTag::Map { has_length } => {
-                let length = has_length
-                    .then(|| {
-                        varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)
-                    })
-                    .transpose()?;
-                if length == Some(0) {
+            Tag::Map { len } => {
+                if len == Some(0) {
                     self.reader.finish();
                 }
                 ValueReading::Map(MapReader {
                     reader: self.reader,
-                    remaining: length,
+                    remaining: len,
                 })
-            }
-            TypeTag::End => return Err(ReadError::UnexpectedEnd.into()),
-        })
-    }
-
-    fn read_integer(
-        mut reader: ReaderRef,
-        width: IntWidth,
-        signed: bool,
-        varint: bool,
-    ) -> ReadResult<Primitive> {
-        // Short but very cryptic macro lol
-        macro_rules! integer_read {
-            (
-                match ($widthparam:ident, $signedparam:ident, $varintparam:ident) {
-                    $($widthty:ident $unsty:ident $unstyprim:ident $sty:ident $styprim:ident $width:literal),*
-                    $(,)?
-                }
-            ) => {
-            match ($widthparam, $signedparam, $varintparam) {
-                $(
-                    (IntWidth::$widthty, true, true) => Primitive::$styprim(
-                        varint::read_signed_varint::<$sty, _>(reader.deref_mut()).map_err(ReadError::from)?.into(),
-                    ),
-                    (IntWidth::$widthty, true, false) => {
-                        let mut buf = [0u8; $width];
-                        reader.deref_mut().read_exact(&mut buf).map_err(ReadError::from)?;
-                        Primitive::$styprim($sty::from_le_bytes(buf).into())
-                    },
-                    (IntWidth::$widthty, false, true) => Primitive::$unstyprim(
-                        varint::read_unsigned_varint::<$unsty, _>(reader.deref_mut()).map_err(ReadError::from)?.into(),
-                    ),
-                    (IntWidth::$widthty, false, false) => {
-                        let mut buf = [0u8; $width];
-                        reader.deref_mut().read_exact(&mut buf).map_err(ReadError::from)?;
-                        Primitive::$unstyprim($unsty::from_le_bytes(buf).into())
-                    },
-                )*
-            }
-            };
-        }
-
-        Ok(integer_read! {
-            match (width, signed, varint) {
-                W8 u8 U8 i8 I8 1,
-                W16 u16 U16 i16 I16 2,
-                W32 u32 U32 i32 I32 4,
-                W64 u64 U64 i64 I64 8,
-                W128 u128 U128 i128 I128 16,
             }
         })
     }
