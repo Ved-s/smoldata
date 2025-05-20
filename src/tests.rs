@@ -1,6 +1,6 @@
-use std::{collections::HashMap, fmt, io};
+use std::{borrow::Cow, collections::HashMap, fmt, io, ops::Deref};
 
-use crate::{SmolRead, SmolReadWrite, SmolWrite};
+use crate::{reader::{ReadError, UnexpectedValueResultExt}, SmolRead, SmolReadWrite, SmolWrite, FORMAT_VERSION};
 
 #[cfg(feature = "raw_value")]
 use crate::raw::RawValue;
@@ -67,6 +67,22 @@ impl<V: fmt::Debug> fmt::Debug for NoLenSerialize<V> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bytes<'a>(pub Cow<'a, [u8]>);
+
+impl SmolWrite for Bytes<'_> {
+    fn write(&self, writer: crate::writer::ValueWriter) -> io::Result<()> {
+        writer.write_bytes(self.0.deref())
+    }
+}
+
+impl SmolRead for Bytes<'_> {
+    fn read(reader: crate::reader::ValueReader) -> crate::reader::ReadResult<Self> {
+        let bytes = reader.read()?.take_bytes().with_type_name_of::<Self>().map_err(ReadError::from)?;
+        Ok(Self(Cow::Owned(bytes.read()?)))
+    }
+}
+
 #[test]
 fn test_reserialize_complex() {
     let data = Struct {
@@ -88,6 +104,76 @@ fn test_reserialize_complex() {
         tup: (false, 786583289812096971589793284203998369),
     };
     test_reserialize(&data);
+}
+
+#[test]
+fn test_repeats() {
+    // let data: Vec<i32> = vec![0, 0, 0, 0, 0, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+
+    // do_test_repeats(&data, true);
+
+    // let data = vec![
+    //     Enum::C("".into(), 0, 0),
+    //     Enum::C("".into(), 0, 0),
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::B,
+    //     Enum::C("".into(), 0, 0),
+    // ];
+
+    // do_test_repeats(&data, false);
+
+    let d: [u8; 3] = [0x80, 0x99, 0xff];
+    let data = [Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d))];
+
+    do_test_repeats(&data, false);
+}
+
+fn do_test_repeats<T: Eq + std::fmt::Debug + SmolReadWrite>(data: &[T], test_smaller: bool) {
+    println!("Vector: {data:?}");
+
+    let mut vec = vec![];
+
+    let mut writer = super::writer::Writer::new_headerless(&mut vec);
+
+    data.write(writer.write()).unwrap();
+
+    writer.finish().unwrap();
+
+    println!();
+    println!(
+        "Vector size: {}, serialized size: {}",
+        data.len(),
+        vec.len()
+    );
+    println!();
+    
+    hexdump(&vec);
+    
+    println!();
+
+    if test_smaller {
+        assert!(vec.len() < data.len());
+    }
+
+    let mut cur = io::Cursor::new(vec);
+
+    let mut reader = super::reader::Reader::new_headerless(&mut cur, FORMAT_VERSION);
+
+    let re = Vec::<T>::read(reader.read()).unwrap();
+
+    reader.finish();
+
+    assert_eq!(data, re);
 }
 
 #[test]
@@ -122,6 +208,8 @@ fn test_raw() {
 
     data.write(writer.write()).unwrap();
 
+    writer.finish().unwrap();
+
     println!("Serialized data:");
     hexdump(&vec);
     println!();
@@ -142,6 +230,8 @@ fn test_raw() {
 
     let inner = Vec::<Enum>::read(reader.read()).unwrap();
 
+    reader.finish();
+
     println!("Deserialized RawValue: {inner:?}\n");
 
     if inner != data.e {
@@ -154,6 +244,8 @@ fn test_raw() {
 
     with_raw.write(writer.write()).unwrap();
 
+    writer.finish().unwrap();
+
     println!("Reserialized data bytes:");
     hexdump(&re_vec);
     println!();
@@ -163,6 +255,7 @@ fn test_raw() {
     let mut reader = super::reader::Reader::new(&mut cur).unwrap();
 
     let reserialized = Struct::read(reader.read()).unwrap();
+    reader.finish();
 
     println!("Reserialized data: {data:?}\n");
 
@@ -182,6 +275,8 @@ fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
 
     data.write(writer.write()).unwrap();
 
+    writer.finish().unwrap();
+
     println!();
 
     hexdump(&vec);
@@ -191,6 +286,8 @@ fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
     let mut reader = super::reader::Reader::new(&mut cur).unwrap();
 
     let re = T::read(reader.read()).unwrap();
+
+    reader.finish();
 
     println!();
 

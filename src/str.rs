@@ -1,9 +1,18 @@
 use std::{ops::Deref, sync::Arc};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum RefArcStr<'a> {
     Arc(Arc<str>),
     Str(&'a str),
+}
+impl RefArcStr<'_> {
+    pub fn into_static(self) -> RefArcStr<'static> {
+        match self {
+            RefArcStr::Arc(a) => RefArcStr::Arc(a),
+            RefArcStr::Str("") => RefArcStr::Str(""),
+            RefArcStr::Str(s) => RefArcStr::Arc(s.into()),
+        }
+    }
 }
 
 impl<'a> From<&'a str> for RefArcStr<'a> {
@@ -37,6 +46,14 @@ impl<'a> From<RefArcStr<'a>> for Arc<str> {
         }
     }
 }
+
+impl<T: Deref<Target = str>> PartialEq<T> for RefArcStr<'_> {
+    fn eq(&self, other: &T) -> bool {
+        self.deref().eq(other.deref())
+    }
+}
+
+impl Eq for RefArcStr<'_> {}
 
 pub enum SdString {
     Empty,

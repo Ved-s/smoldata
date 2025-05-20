@@ -38,7 +38,7 @@ pub const FORMAT_VERSION: u32 = 0;
 pub fn write_into<T: SmolWrite, W: io::Write>(data: &T, mut writer: W) -> Result<(), io::Error> {
     let mut writer = crate::writer::Writer::new(&mut writer)?;
     data.write(writer.write())?;
-    writer.finish();
+    writer.finish()?;
     Ok(())
 }
 
@@ -253,6 +253,18 @@ impl<K: SmolWrite, V: SmolWrite> SmolWrite for BTreeMap<K, V> {
         }
 
         map.finish()
+    }
+}
+
+impl<T: SmolWrite> SmolWrite for &mut T {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        <T as SmolWrite>::write(self, writer)
+    }
+}
+
+impl<T: SmolWrite> SmolWrite for &T {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        <T as SmolWrite>::write(self, writer)
     }
 }
 

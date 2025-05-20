@@ -31,6 +31,12 @@ pub enum ReaderInitError {
     UnsupportedVersion(u32),
 }
 
+#[derive(Clone, Copy)]
+pub enum TagPeek {
+    None,
+    LastTag,
+}
+
 #[derive(Clone)]
 pub enum TagOrEnd {
     Tag(Tag<'static>),
@@ -40,10 +46,12 @@ pub enum TagOrEnd {
 pub struct Reader<'a> {
     reader: &'a mut dyn io::Read,
 
-    tag_peek: Option<TagOrEnd>,
     string_map: BTreeMap<u32, Arc<str>>,
-
     format_version: u32,
+    tag_peek: TagPeek,
+
+    last_tag: Option<Tag<'static>>,
+    last_tag_repeat: usize,
 
     #[cfg(smoldata_int_dev_error_checks)]
     finish_parent_levels: BTreeSet<NonZeroUsize>,
@@ -76,8 +84,11 @@ impl<'a> Reader<'a> {
 
         Self {
             reader,
-            tag_peek: Default::default(),
+            tag_peek: TagPeek::None,
             string_map: Default::default(),
+
+            last_tag: None,
+            last_tag_repeat: 0,
 
             format_version,
 
@@ -125,6 +136,15 @@ impl<'a> Reader<'a> {
     }
 
     fn read_tag_or_end(&mut self) -> ReadResult<TagOrEnd> {
+
+        if self.last_tag_repeat > 0 {
+            let Some(tag) = self.last_tag.clone() else {
+                panic!("last_tag_repeat > 0 but last_tag is None");
+            };
+            self.last_tag_repeat -= 1;
+            return Ok(TagOrEnd::Tag(tag));
+        }
+
         let mut tag_byte = 0u8;
         self.reader
             .read_exact(std::slice::from_mut(&mut tag_byte))
@@ -137,7 +157,9 @@ impl<'a> Reader<'a> {
             }
         };
 
-        Ok(TagOrEnd::Tag(match tag {
+        let mut repeat = false;
+
+        let tag = match tag {
             TagType::Unit => Tag::Unit,
             TagType::BoolFalse => Tag::Bool(false),
             TagType::BoolTrue => Tag::Bool(true),
@@ -299,16 +321,59 @@ impl<'a> Reader<'a> {
                     ty: StructTag::Struct { len },
                 }
             }
+
+            TagType::RepeatTag => {
+                if self.last_tag_repeat != 0 {
+                    return Err(ReadError::StackedTagRepeats.into());
+                }
+                match &self.last_tag {
+                    None => return Err(ReadError::NothingToRepeat.into()),
+                    Some(t) => {
+                        repeat = true;
+                        t.clone()
+                    },
+                }
+            }
+
+            TagType::RepeatTagMany => {
+                if self.last_tag_repeat != 0 {
+                    return Err(ReadError::StackedTagRepeats.into());
+                }
+                let count: usize = varint::read_unsigned_varint(&mut *self.reader).map_err(ReadError::from)?;
+                let tag = match &self.last_tag {
+                    None => return Err(ReadError::NothingToRepeat.into()),
+                    Some(t) => {
+                        repeat = true;
+                        t.clone()
+                    },
+                };
+
+                let Some(count) = count.checked_add(1) else {
+                    return Err(ReadError::TooManyRepeats.into());
+                };
+
+                self.last_tag_repeat = count;
+
+                tag
+            }
+
             TagType::End => return Ok(TagOrEnd::End),
-        }))
+        };
+
+        if !repeat {
+            self.last_tag = Some(tag.clone());
+        }
+
+        Ok(TagOrEnd::Tag(tag))
     }
 
     fn read_tag_inner(&mut self) -> ReadResult<Tag<'static>> {
-        if let Some(tag) = self.tag_peek.take() {
-            return match tag {
-                TagOrEnd::Tag(tag) => Ok(tag),
-                TagOrEnd::End => Err(ReadError::UnexpectedEnd.into()),
-            };
+        match self.tag_peek {
+            TagPeek::None => {}
+            TagPeek::LastTag => {
+                self.tag_peek = TagPeek::None;
+                return Ok(self.last_tag.clone().expect("proper tag_peek and last_tag"))
+            }
         }
 
         match self.read_tag_or_end()? {
@@ -318,32 +383,28 @@ impl<'a> Reader<'a> {
     }
 
     fn peek_tag_inner(&mut self) -> ReadResult<&Tag<'static>> {
-        if self.tag_peek.is_none() {
-            self.tag_peek = Some(self.read_tag_or_end()?);
+        if matches!(self.tag_peek, TagPeek::None) {
+            if let TagOrEnd::End = self.read_tag_or_end()? {
+                return Err(ReadError::UnexpectedEnd.into())
+            }
+            self.tag_peek = TagPeek::LastTag;
         }
 
         match &self.tag_peek {
-            Some(TagOrEnd::End) => Err(ReadError::UnexpectedEnd.into()),
-            Some(TagOrEnd::Tag(tag)) => Ok(tag),
-            None => unreachable!(),
+            TagPeek::None => unreachable!(),
+            TagPeek::LastTag => Ok(self.last_tag.as_ref().expect("proper tag_peek and last_tag")),
         }
     }
 
     fn read_seq_end_inner(&mut self) -> ReadResult<bool> {
-        if self.tag_peek.is_none() {
-            self.tag_peek = Some(self.read_tag_or_end()?);
+        if matches!(self.tag_peek, TagPeek::None) {
+            if let TagOrEnd::End = self.read_tag_or_end()? {
+                return Ok(true);
+            }
+            self.tag_peek = TagPeek::LastTag;
         }
 
-        let end = self
-            .tag_peek
-            .as_ref()
-            .is_some_and(|v| matches!(v, TagOrEnd::End));
-
-        if end {
-            self.tag_peek.take();
-        }
-
-        Ok(end)
+        Ok(false)
     }
 
     fn read_str_inner(&mut self) -> ReadResult<Arc<str>> {
@@ -605,6 +666,15 @@ pub enum ReadError {
 
     #[error("Input stream is of unsupported version {0}, max supported is {FORMAT_VERSION}")]
     UnsupportedVersion(u32),
+
+    #[error("Tried begin repeating tags while already repeating")]
+    StackedTagRepeats,
+
+    #[error("Tried to repeat tags before any tags were read")]
+    NothingToRepeat,
+
+    #[error("Tried to repeat tags too many times (hitting usize limit)")]
+    TooManyRepeats,
 }
 
 impl From<ReaderInitError> for ReadError {
@@ -965,8 +1035,7 @@ impl BytesReader<'_, '_> {
     pub fn read(mut self) -> ReadResult<Vec<u8>> {
         let mut reader = self.reader.get();
 
-        let length = varint::read_unsigned_varint(reader.deref_mut()).map_err(ReadError::from)?;
-        let mut vec = vec![0u8; length];
+        let mut vec = vec![0u8; self.len];
         reader
             .deref_mut()
             .read_exact(&mut vec)
@@ -1152,8 +1221,6 @@ impl<'rf, 'rd> StructReading<'rf, 'rd> {
         }
     }
 }
-
-
 
 pub struct EnumReading<'rf, 'rd> {
     reader: ReaderLevel<'rf, 'rd>,
@@ -1549,7 +1616,7 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
             Tag::Integer(int) => {
                 self.reader.finish();
                 ValueReading::Primitive(int.into())
-            },
+            }
             Tag::Char(c) => {
                 self.reader.finish();
                 ValueReading::Primitive(Primitive::Char(c))
@@ -1576,7 +1643,7 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
             }),
             Tag::Bytes { len } => ValueReading::Bytes(BytesReader {
                 reader: self.reader,
-                len
+                len,
             }),
             Tag::Option(OptionTag::None) => {
                 self.reader.finish();
@@ -1616,7 +1683,7 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
                 ty,
             }),
             Tag::Array { len } => {
-                if len== Some(0) {
+                if len == Some(0) {
                     self.reader.finish();
                 }
                 ValueReading::Array(ArrayReader {

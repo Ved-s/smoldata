@@ -151,6 +151,12 @@ define_tag! {
         #[doc = "struct variant, name as `Self::Str` data and `Self::Struct` data follow"]
         StructVariant = 43,
 
+        #[doc = "Meta tag, repeat previously read tag"]
+        RepeatTag = 44,
+
+        #[doc = "Meta tag, repeat previously read tag N+2 more times, N as varint encoded `usize` follows"]
+        RepeatTagMany = 45,
+
         #[doc = "End marker for Seq and Map"]
         End = 255,
     }
@@ -179,7 +185,7 @@ pub enum StructType {
     Struct,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegerTag {
     I8(i8),
     U8(u8),
@@ -210,7 +216,7 @@ impl From<IntegerTag> for Primitive {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructTag {
     Unit,
 
@@ -241,7 +247,7 @@ impl StructTag {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Tag<'a> {
     Unit,
     Bool(bool),
@@ -315,6 +321,35 @@ impl Tag<'_> {
             Tag::Map { len: None } => true,
             Tag::Map { len: Some(len) } => *len > 0,
             Tag::Tuple { len } => *len > 0,
+        }
+    }
+
+    pub fn into_static(self) -> Tag<'static> {
+        match self {
+            Tag::Unit => Tag::Unit,
+            Tag::Bool(v) => Tag::Bool(v),
+            Tag::Integer(v) => Tag::Integer(v),
+            Tag::F32(v) => Tag::F32(v),
+            Tag::F64(v) => Tag::F64(v),
+            Tag::Char(v) => Tag::Char(v),
+            Tag::Str(v) => Tag::Str(v.into_static()),
+            Tag::StrDirect { len } => Tag::StrDirect  { len },
+            Tag::EmptyStr => Tag::EmptyStr,
+            Tag::Bytes { len } => Tag::Bytes { len },
+            Tag::Option(v) => Tag::Option(v),
+            Tag::Struct(v) => Tag::Struct(v),
+            Tag::Variant { name, ty } => Tag::Variant { name, ty },
+            Tag::Array { len } => Tag::Array { len },
+            Tag::Map { len } => Tag::Map { len },
+            Tag::Tuple { len } => Tag::Tuple { len },
+        }
+    }
+
+    pub fn eq_with_nan(&self, other: &Tag) -> bool {
+        match (self, other) {
+            (Self::F32(a), Tag::F32(b)) => a.eq(b) || (a.is_nan() && b.is_nan()),
+            (Self::F64(a), Tag::F64(b)) => a.eq(b) || (a.is_nan() && b.is_nan()),
+            _ => self.eq(other)
         }
     }
 }

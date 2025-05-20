@@ -33,7 +33,7 @@ impl RawValue {
         let mut vec = vec![];
         let mut writer = crate::writer::Writer::new_headerless(&mut vec);
         obj.write(writer.write())?;
-        writer.finish();
+        writer.finish()?;
         Ok(Self(vec.into_boxed_slice())) 
     }
 
@@ -178,7 +178,7 @@ fn copy_object(mut reader: ReaderRef, mut writer: WriterRef) -> ReadResult<()> {
 
         let tag = reader.read_tag()?;
 
-        writer.write_tag(&tag).map_err(ReadError::from)?;
+        writer.write_tag(tag.clone()).map_err(ReadError::from)?;
 
         match tag {
             Tag::Unit

@@ -22,6 +22,9 @@ pub struct Writer<'a> {
     string_map: HashMap<Arc<str>, u32>,
     next_string_id: u32,
 
+    last_tag: Option<Tag<'static>>,
+    last_tag_extra_repeat_times: usize,
+
     #[cfg(smoldata_int_dev_error_checks)]
     finish_parent_levels: BTreeSet<NonZeroUsize>,
 
@@ -42,6 +45,9 @@ impl<'a> Writer<'a> {
             writer,
             string_map: Default::default(),
             next_string_id: 0,
+
+            last_tag: None,
+            last_tag_extra_repeat_times: 0,
 
             #[cfg(smoldata_int_dev_error_checks)]
             finish_parent_levels: Default::default(),
@@ -72,13 +78,15 @@ impl<'a> Writer<'a> {
     }
 
     #[track_caller]
-    pub fn finish(self) -> &'a mut dyn io::Write {
+    pub fn finish(mut self) -> io::Result<&'a mut dyn io::Write> {
         #[cfg(smoldata_int_dev_error_checks)]
         if self.level != 0 {
             panic!("Attempt to finish before finishing children")
         }
 
-        self.writer
+        self.flush_repeats()?;
+
+        Ok(self.writer)
     }
 
     #[allow(unused)]
@@ -183,23 +191,61 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn write_tag_inner(&mut self, tag: &Tag) -> io::Result<()> {
+    fn flush_repeats(&mut self) -> io::Result<()> {
+        match self.last_tag_extra_repeat_times {
+            0 => {}
+            1 => {
+                self.writer.write_all(&[TagType::RepeatTag.into()])?;
+                self.last_tag_extra_repeat_times = 0;
+            }
+            rep @ 2.. => {
+                self.writer.write_all(&[TagType::RepeatTagMany.into()])?;
+                varint::write_unsigned_varint(&mut *self.writer, rep - 2)?;
+                self.last_tag_extra_repeat_times = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_tag_inner(&mut self, mut tag: Tag) -> io::Result<()> {
         // todo: make it reserve unused tag type values for frequently written tags
 
-        match tag {
-            Tag::Unit => self.writer.write_all(&[TagType::Unit.into()]),
-            Tag::Bool(true) => self.writer.write_all(&[TagType::BoolTrue.into()]),
-            Tag::Bool(false) => self.writer.write_all(&[TagType::BoolFalse.into()]),
-            Tag::Integer(v) => self.write_integer(v),
+        let equal_tag = self.last_tag.as_ref().filter(|t| t.eq_with_nan(&tag));
+        if let Some(last) = &self.last_tag {
+            if last.eq_with_nan(&tag) {
+                if last.has_more_data() {
+                    assert_eq!(self.last_tag_extra_repeat_times, 0);
+                    self.writer.write_all(&[TagType::RepeatTag.into()])?;
+                    return Ok(());
+                } else {
+                    self.last_tag_extra_repeat_times += 1;
+                    return Ok(());
+                }
+            } else {
+                self.flush_repeats()?;
+            }
+        }
+
+        match &mut tag {
+            Tag::Unit => {
+                self.writer.write_all(&[TagType::Unit.into()])?;
+            }
+            Tag::Bool(true) => {
+                self.writer.write_all(&[TagType::BoolTrue.into()])?;
+            }
+            Tag::Bool(false) => {
+                self.writer.write_all(&[TagType::BoolFalse.into()])?;
+            }
+            Tag::Integer(v) => {
+                self.write_integer(v)?;
+            }
             Tag::F32(v) => {
                 self.writer.write_all(&[TagType::F32.into()])?;
                 self.writer.write_all(&v.to_le_bytes())?;
-                Ok(())
             }
             Tag::F64(v) => {
                 self.writer.write_all(&[TagType::F64.into()])?;
                 self.writer.write_all(&v.to_le_bytes())?;
-                Ok(())
             }
             Tag::Char(v) => {
                 let v = *v as u32;
@@ -211,38 +257,42 @@ impl<'a> Writer<'a> {
                     self.writer.write_all(&[TagType::Char32.into()])?;
                     self.writer.write_all(&v.to_le_bytes())?;
                 }
-                Ok(())
             }
             Tag::Str(s) => {
                 self.writer.write_all(&[TagType::Str.into()])?;
-                self.write_str_inner(s.clone())
+                let arc = self.write_str_inner(s.clone())?;
+                *s = RefArcStr::Arc(arc);
             }
             Tag::StrDirect { len } => {
                 self.writer.write_all(&[TagType::StrDirect.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
-            Tag::EmptyStr => self.writer.write_all(&[TagType::EmptyStr.into()]),
+            Tag::EmptyStr => {
+                self.writer.write_all(&[TagType::EmptyStr.into()])?;
+            }
             Tag::Bytes { len } => {
                 self.writer.write_all(&[TagType::Bytes.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
-            Tag::Option(OptionTag::None) => self.writer.write_all(&[TagType::None.into()]),
-            Tag::Option(OptionTag::Some) => self.writer.write_all(&[TagType::Some.into()]),
-            Tag::Struct(StructTag::Unit) => self.writer.write_all(&[TagType::UnitStruct.into()]),
+            Tag::Option(OptionTag::None) => {
+                self.writer.write_all(&[TagType::None.into()])?;
+            }
+            Tag::Option(OptionTag::Some) => {
+                self.writer.write_all(&[TagType::Some.into()])?;
+            }
+            Tag::Struct(StructTag::Unit) => {
+                self.writer.write_all(&[TagType::UnitStruct.into()])?;
+            }
             Tag::Struct(StructTag::Newtype) => {
-                self.writer.write_all(&[TagType::NewtypeStruct.into()])
+                self.writer.write_all(&[TagType::NewtypeStruct.into()])?;
             }
             Tag::Struct(StructTag::Tuple { len }) => {
                 self.writer.write_all(&[TagType::TupleStruct.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Struct(StructTag::Struct { len }) => {
                 self.writer.write_all(&[TagType::Struct.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Variant {
                 name,
@@ -250,7 +300,6 @@ impl<'a> Writer<'a> {
             } => {
                 self.writer.write_all(&[TagType::UnitVariant.into()])?;
                 self.write_str_inner(name.clone().into())?;
-                Ok(())
             }
             Tag::Variant {
                 name,
@@ -258,7 +307,6 @@ impl<'a> Writer<'a> {
             } => {
                 self.writer.write_all(&[TagType::NewtypeVariant.into()])?;
                 self.write_str_inner(name.clone().into())?;
-                Ok(())
             }
             Tag::Variant {
                 name,
@@ -267,7 +315,6 @@ impl<'a> Writer<'a> {
                 self.writer.write_all(&[TagType::TupleVariant.into()])?;
                 self.write_str_inner(name.clone().into())?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Variant {
                 name,
@@ -276,35 +323,36 @@ impl<'a> Writer<'a> {
                 self.writer.write_all(&[TagType::StructVariant.into()])?;
                 self.write_str_inner(name.clone().into())?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Array { len: None } => {
                 self.writer.write_all(&[TagType::Array.into()])?;
-                Ok(())
             }
             Tag::Array { len: Some(len) } => {
                 self.writer.write_all(&[TagType::LenArray.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Map { len: None } => {
                 self.writer.write_all(&[TagType::Map.into()])?;
-                Ok(())
             }
             Tag::Map { len: Some(len) } => {
                 self.writer.write_all(&[TagType::LenMap.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
             Tag::Tuple { len } => {
                 self.writer.write_all(&[TagType::Tuple.into()])?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
-                Ok(())
             }
-        }
+        };
+
+        let tag = tag.into_static();
+        self.last_tag = Some(tag);
+        self.last_tag_extra_repeat_times = 0;
+
+        Ok(())
     }
 
     fn write_seq_end_inner(&mut self) -> io::Result<()> {
+        self.flush_repeats()?;
         self.writer.write_all(&[TagType::End.into()])
     }
 
@@ -312,10 +360,11 @@ impl<'a> Writer<'a> {
         self.string_map.get_key_value(str).map(|kv| kv.0.clone())
     }
 
-    fn write_str_inner(&mut self, str: RefArcStr) -> io::Result<()> {
-        match self.string_map.get(str.deref()) {
-            Some(r) => {
-                varint::write_varint_with_sign(&mut self.writer, *r, Sign::Positive)?;
+    fn write_str_inner(&mut self, str: RefArcStr) -> io::Result<Arc<str>> {
+        match self.string_map.get_key_value(str.deref()) {
+            Some((s, i)) => {
+                varint::write_varint_with_sign(&mut self.writer, *i, Sign::Positive)?;
+                Ok(s.clone())
             }
             None => {
                 let index = self.next_string_id;
@@ -326,11 +375,13 @@ impl<'a> Writer<'a> {
                 varint::write_unsigned_varint(&mut self.writer, arc.len())?;
                 self.writer.write_all(arc.as_bytes())?;
 
+                let arc_clone = arc.clone();
+
                 self.string_map.insert(arc, index);
+
+                Ok(arc_clone)
             }
         }
-
-        Ok(())
     }
 }
 
@@ -444,7 +495,7 @@ pub(crate) struct WriterRef<'rf, 'wr> {
 
 #[allow(unused)]
 impl<'wr> WriterRef<'_, 'wr> {
-    pub fn write_tag(&mut self, tag: &Tag) -> io::Result<()> {
+    pub fn write_tag(&mut self, tag: Tag) -> io::Result<()> {
         self.writer.write_tag_inner(tag)
     }
 
@@ -457,7 +508,8 @@ impl<'wr> WriterRef<'_, 'wr> {
     }
 
     pub fn write_str(&mut self, str: RefArcStr) -> io::Result<()> {
-        self.writer.write_str_inner(str)
+        self.writer.write_str_inner(str)?;
+        Ok(())
     }
 
     pub fn inner(&mut self) -> &mut dyn io::Write {
@@ -494,7 +546,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_primitive<P: Primitive>(mut self, pri: P) -> io::Result<()> {
         let mut writer = self.writer.get();
-        writer.write_tag(&pri.into_tag())?;
+        writer.write_tag(pri.into_tag())?;
         self.writer.finish();
         Ok(())
     }
@@ -504,12 +556,12 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
         let mut writer = self.writer.get();
         let str = str.into();
         if str.is_empty() {
-            writer.write_tag(&Tag::EmptyStr)?;
+            writer.write_tag(Tag::EmptyStr)?;
         } else if str.len() > MAX_OPT_STR_LEN {
-            writer.write_tag(&Tag::StrDirect { len: str.len() })?;
+            writer.write_tag(Tag::StrDirect { len: str.len() })?;
             writer.write_all(str.as_bytes())?;
         } else {
-            writer.write_tag(&Tag::Str(str))?;
+            writer.write_tag(Tag::Str(str))?;
         }
 
         self.writer.finish();
@@ -519,7 +571,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_bytes(mut self, bytes: &[u8]) -> io::Result<()> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Bytes { len: bytes.len() })?;
+        writer.write_tag(Tag::Bytes { len: bytes.len() })?;
         writer.write_all(bytes)?;
         self.writer.finish();
 
@@ -529,7 +581,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_none(mut self) -> io::Result<()> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Option(OptionTag::None))?;
+        writer.write_tag(Tag::Option(OptionTag::None))?;
         self.writer.finish();
 
         Ok(())
@@ -538,7 +590,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_some(mut self) -> io::Result<Self> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Option(OptionTag::Some))?;
+        writer.write_tag(Tag::Option(OptionTag::Some))?;
 
         /// Some() stays on the same level
         Ok(self)
@@ -547,7 +599,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_unit_struct(mut self) -> io::Result<()> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Struct(StructTag::Unit))?;
+        writer.write_tag(Tag::Struct(StructTag::Unit))?;
         self.writer.finish();
 
         Ok(())
@@ -556,7 +608,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_newtype_struct(mut self) -> io::Result<Self> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Struct(StructTag::Newtype))?;
+        writer.write_tag(Tag::Struct(StructTag::Newtype))?;
 
         /// Newtype structs stay on the same level
         Ok(self)
@@ -565,7 +617,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_tuple_struct(mut self, fields: usize) -> io::Result<SizedTupleWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Struct(StructTag::Tuple { len: fields }))?;
+        writer.write_tag(Tag::Struct(StructTag::Tuple { len: fields }))?;
 
         if fields == 0 {
             self.writer.finish();
@@ -581,7 +633,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_struct(mut self, fields: usize) -> io::Result<SizedStructWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Struct(StructTag::Struct { len: fields }))?;
+        writer.write_tag(Tag::Struct(StructTag::Struct { len: fields }))?;
 
         if fields == 0 {
             self.writer.finish();
@@ -601,7 +653,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
             RefArcStr::Arc(a) => a,
             RefArcStr::Str(s) => writer.try_get_cached_str(s).unwrap_or_else(|| s.into()),
         };
-        writer.write_tag(&Tag::Variant {
+        writer.write_tag(Tag::Variant {
             name,
             ty: StructTag::Unit,
         })?;
@@ -620,7 +672,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
             RefArcStr::Arc(a) => a,
             RefArcStr::Str(s) => writer.try_get_cached_str(s).unwrap_or_else(|| s.into()),
         };
-        writer.write_tag(&Tag::Variant {
+        writer.write_tag(Tag::Variant {
             name,
             ty: StructTag::Newtype,
         })?;
@@ -640,7 +692,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
             RefArcStr::Arc(a) => a,
             RefArcStr::Str(s) => writer.try_get_cached_str(s).unwrap_or_else(|| s.into()),
         };
-        writer.write_tag(&Tag::Variant {
+        writer.write_tag(Tag::Variant {
             name,
             ty: StructTag::Tuple { len: fields },
         })?;
@@ -667,7 +719,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
             RefArcStr::Arc(a) => a,
             RefArcStr::Str(s) => writer.try_get_cached_str(s).unwrap_or_else(|| s.into()),
         };
-        writer.write_tag(&Tag::Variant {
+        writer.write_tag(Tag::Variant {
             name,
             ty: StructTag::Struct { len: fields },
         })?;
@@ -686,7 +738,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_tuple(mut self, fields: usize) -> io::Result<SizedTupleWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Tuple { len: fields })?;
+        writer.write_tag(Tag::Tuple { len: fields })?;
 
         if fields == 0 {
             self.writer.finish();
@@ -702,7 +754,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_seq(mut self, len: Option<usize>) -> io::Result<ArrayWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Array { len })?;
+        writer.write_tag(Tag::Array { len })?;
 
         if len == Some(0) {
             self.writer.finish();
@@ -717,7 +769,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
     pub fn write_map(mut self, len: Option<usize>) -> io::Result<MapWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
-        writer.write_tag(&Tag::Map { len })?;
+        writer.write_tag(Tag::Map { len })?;
 
         if len == Some(0) {
             self.writer.finish();
