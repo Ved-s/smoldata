@@ -108,29 +108,33 @@ fn test_reserialize_complex() {
 
 #[test]
 fn test_repeats() {
-    // let data: Vec<i32> = vec![0, 0, 0, 0, 0, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+    let data = vec![0, 0, 0, 0, 0, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 4, 4, 4];
 
-    // do_test_repeats(&data, true);
+    do_test_repeats(&data, true);
 
-    // let data = vec![
-    //     Enum::C("".into(), 0, 0),
-    //     Enum::C("".into(), 0, 0),
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::B,
-    //     Enum::C("".into(), 0, 0),
-    // ];
+    let data: Vec<Option<i32>> = vec![None, None, None, None, None, None, None, None, None, None];
 
-    // do_test_repeats(&data, false);
+    do_test_repeats(&data, true);
+
+    let data = vec![
+        Enum::C("".into(), 0, 0),
+        Enum::C("".into(), 0, 0),
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::B,
+        Enum::C("".into(), 0, 0),
+    ];
+
+    do_test_repeats(&data, false);
 
     let d: [u8; 3] = [0x80, 0x99, 0xff];
     let data = [Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d))];

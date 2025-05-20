@@ -20,7 +20,9 @@ use std::{
     collections::{BTreeMap, HashMap},
     hash::Hash,
     io::{self, ErrorKind},
-    ops::Deref, rc::Rc, sync::Arc,
+    ops::Deref,
+    rc::Rc,
+    sync::Arc,
 };
 
 #[cfg(feature = "raw_value")]
@@ -286,6 +288,15 @@ impl<T: SmolWrite> SmolWrite for Arc<T> {
     }
 }
 
+impl<T: SmolWrite> SmolWrite for Option<T> {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        match self {
+            None => writer.write_none(),
+            Some(v) => <T as SmolWrite>::write(v, writer.write_some()?),
+        }
+    }
+}
+
 macro_rules! impl_smolread_primitive {
     ($($ty:ty),* $(,)?) => {
         $(
@@ -366,7 +377,8 @@ impl<T: SmolRead, const N: usize> SmolRead for [T; N] {
                     expected: N,
                     got: rem,
                     type_name: std::any::type_name::<Self>(),
-                }.into());
+                }
+                .into());
             }
         }
 
@@ -379,7 +391,8 @@ impl<T: SmolRead, const N: usize> SmolRead for [T; N] {
                     expected: N,
                     got: i + 1,
                     type_name: std::any::type_name::<Self>(),
-                }.into());
+                }
+                .into());
             }
             arr[i] = Some(T::read(reader)?);
             i += 1;
@@ -390,7 +403,8 @@ impl<T: SmolRead, const N: usize> SmolRead for [T; N] {
                 expected: N,
                 got: i,
                 type_name: std::any::type_name::<Self>(),
-            }.into());
+            }
+            .into());
         }
 
         let arr = arr.map(|v| v.expect("sanity"));
@@ -513,5 +527,20 @@ impl<T: SmolRead + Sized> SmolRead for Rc<T> {
 impl<T: SmolRead + Sized> SmolRead for Arc<T> {
     fn read(reader: ValueReader) -> ReadResult<Self> {
         <T as SmolRead>::read(reader).map(Into::into)
+    }
+}
+
+impl<T: SmolRead + Sized> SmolRead for Option<T> {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        let reader = reader
+            .read()?
+            .take_option()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?;
+
+        Ok(match reader {
+            None => None,
+            Some(r) => Some(<T as SmolRead>::read(r)?),
+        })
     }
 }
