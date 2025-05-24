@@ -675,6 +675,12 @@ pub enum ReadError {
 
     #[error("Tried to repeat tags too many times (hitting usize limit)")]
     TooManyRepeats,
+
+    #[error("Value {value} is outside of bounds of {type_name}")]
+    ValueOutOfBounds {
+        value: String,
+        type_name: &'static str,
+    }
 }
 
 impl From<ReaderInitError> for ReadError {
@@ -691,26 +697,26 @@ impl From<ReaderInitError> for ReadError {
 #[derive(Debug, thiserror::Error)]
 #[error("Unexpected data wile reading {type_name}: Expected {expected:?}, found {found:?}")]
 pub struct UnexpectedValueForTypeError {
-    expected: ValueTypeRequirement,
-    found: ValueType,
-    type_name: &'static str,
+    pub expected: ValueTypeRequirement,
+    pub found: ValueType,
+    pub type_name: &'static str,
 }
 
 // TODO: other errors want variant name, make it into an Enum type/variant and use it instead type name in errors
 #[derive(Debug, thiserror::Error)]
 #[error("Unexpected data wile reading {type_name}::{variant_name}: Expected {expected:?}, found {found:?}")]
 pub struct UnexpectedValueForVariantError {
-    expected: ValueTypeRequirement,
-    found: ValueType,
-    type_name: &'static str,
-    variant_name: &'static str,
+    pub expected: ValueTypeRequirement,
+    pub found: ValueType,
+    pub type_name: &'static str,
+    pub variant_name: &'static str,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("Expected {expected:?}, found {found:?}")]
 pub struct UnexpectedValueError {
-    expected: ValueTypeRequirement,
-    found: ValueType,
+    pub expected: ValueTypeRequirement,
+    pub found: ValueType,
 }
 
 impl UnexpectedValueError {

@@ -27,7 +27,7 @@ use std::{
 
 #[cfg(feature = "raw_value")]
 use raw::RawValue;
-use reader::{ReadError, ReadResult, UnexpectedValueResultExt, ValueReader};
+use reader::{ReadError, ReadResult, UnexpectedValueError, UnexpectedValueResultExt, ValueReader};
 use writer::ValueWriter;
 
 pub use smoldata_derive::{SmolRead, SmolReadWrite, SmolWrite};
@@ -159,6 +159,36 @@ impl_smolwrite_primitive!(
     i128,
     u128
 );
+
+impl SmolWrite for usize {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        #[cfg(target_pointer_width = "16")]
+        type UsizeBackingType = u16;
+
+        #[cfg(target_pointer_width = "32")]
+        type UsizeBackingType = u32;
+
+        #[cfg(target_pointer_width = "64")]
+        type UsizeBackingType = u64;
+
+        <UsizeBackingType as SmolWrite>::write(&(*self as UsizeBackingType), writer)
+    }
+}
+
+impl SmolWrite for isize {
+    fn write(&self, writer: ValueWriter) -> io::Result<()> {
+        #[cfg(target_pointer_width = "16")]
+        type IsizeBackingType = i16;
+
+        #[cfg(target_pointer_width = "32")]
+        type IsizeBackingType = i32;
+
+        #[cfg(target_pointer_width = "64")]
+        type IsizeBackingType = i64;
+
+        <IsizeBackingType as SmolWrite>::write(&(*self as IsizeBackingType), writer)
+    }
+}
 
 impl SmolWrite for String {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
@@ -328,6 +358,110 @@ impl_smolread_primitive!(
     i128,
     u128
 );
+
+#[allow(clippy::unnecessary_fallible_conversions)]
+impl SmolRead for usize {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        let prim = reader
+            .read()?
+            .take_primitive()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?;
+
+        match prim {
+            reader::Primitive::U16(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            reader::Primitive::U32(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            reader::Primitive::U64(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            _ => {
+                let err = UnexpectedValueError {
+                    expected: reader::ValueTypeRequirement::Primitive(None),
+                    found: reader::ValueType::Primitive(prim.ty()),
+                };
+
+                Err(ReadError::from(err.with_type_name_of::<Self>()).into())
+            }
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_fallible_conversions)]
+impl SmolRead for isize {
+    fn read(reader: ValueReader) -> ReadResult<Self> {
+        let prim = reader
+            .read()?
+            .take_primitive()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?;
+
+        match prim {
+            reader::Primitive::I16(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            reader::Primitive::I32(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            reader::Primitive::I64(v) => match Self::try_from(v) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    Err(ReadError::ValueOutOfBounds {
+                        value: v.to_string(),
+                        type_name: std::any::type_name::<Self>(),
+                    }
+                    .into())
+                }
+            },
+            _ => {
+                let err = UnexpectedValueError {
+                    expected: reader::ValueTypeRequirement::Primitive(None),
+                    found: reader::ValueType::Primitive(prim.ty()),
+                };
+
+                Err(ReadError::from(err.with_type_name_of::<Self>()).into())
+            }
+        }
+    }
+}
 
 impl SmolRead for String {
     fn read(reader: ValueReader) -> ReadResult<Self> {
