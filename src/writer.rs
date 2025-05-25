@@ -260,7 +260,7 @@ impl<'a> Writer<'a> {
             }
             Tag::Str(s) => {
                 self.writer.write_all(&[TagType::Str.into()])?;
-                let arc = self.write_str_inner(s.clone())?;
+                let arc = self.write_str_inner(s.clone(), false)?;
                 *s = RefArcStr::Arc(arc);
             }
             Tag::StrDirect { len } => {
@@ -299,21 +299,21 @@ impl<'a> Writer<'a> {
                 ty: StructTag::Unit,
             } => {
                 self.writer.write_all(&[TagType::UnitVariant.into()])?;
-                self.write_str_inner(name.clone().into())?;
+                self.write_str_inner(name.clone().into(), false)?;
             }
             Tag::Variant {
                 name,
                 ty: StructTag::Newtype,
             } => {
                 self.writer.write_all(&[TagType::NewtypeVariant.into()])?;
-                self.write_str_inner(name.clone().into())?;
+                self.write_str_inner(name.clone().into(), false)?;
             }
             Tag::Variant {
                 name,
                 ty: StructTag::Tuple { len },
             } => {
                 self.writer.write_all(&[TagType::TupleVariant.into()])?;
-                self.write_str_inner(name.clone().into())?;
+                self.write_str_inner(name.clone().into(), false)?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
             }
             Tag::Variant {
@@ -321,7 +321,7 @@ impl<'a> Writer<'a> {
                 ty: StructTag::Struct { len },
             } => {
                 self.writer.write_all(&[TagType::StructVariant.into()])?;
-                self.write_str_inner(name.clone().into())?;
+                self.write_str_inner(name.clone().into(), false)?;
                 varint::write_unsigned_varint(&mut *self.writer, *len)?;
             }
             Tag::Array { len: None } => {
@@ -360,7 +360,10 @@ impl<'a> Writer<'a> {
         self.string_map.get_key_value(str).map(|kv| kv.0.clone())
     }
 
-    fn write_str_inner(&mut self, str: RefArcStr) -> io::Result<Arc<str>> {
+    fn write_str_inner(&mut self, str: RefArcStr, external: bool) -> io::Result<Arc<str>> {
+        if external {
+            self.flush_repeats()?;
+        }
         match self.string_map.get_key_value(str.deref()) {
             Some((s, i)) => {
                 varint::write_varint_with_sign(&mut self.writer, *i, Sign::Positive)?;
@@ -508,7 +511,7 @@ impl<'wr> WriterRef<'_, 'wr> {
     }
 
     pub fn write_str(&mut self, str: RefArcStr) -> io::Result<()> {
-        self.writer.write_str_inner(str)?;
+        self.writer.write_str_inner(str, true)?;
         Ok(())
     }
 

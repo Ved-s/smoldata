@@ -83,6 +83,22 @@ impl SmolRead for Bytes<'_> {
     }
 }
 
+#[derive(SmolRead, Debug, Clone, PartialEq, Eq)]
+#[sd(smoldata = crate)]
+struct BugTest1 {
+    points: [bool; 2],
+    unit: (),
+}
+
+impl crate::SmolWrite for BugTest1 {
+    fn write(&self, writer: crate::writer::ValueWriter) -> ::std::io::Result<()> {
+        let mut struc = writer.write_struct(2usize)?;
+        <[bool; 2] as crate::SmolWrite>::write(&self.points, struc.write_field("points")?)?;
+        <() as crate::SmolWrite>::write(&self.unit, struc.write_field("unit")?)?;
+        Ok(())
+    }
+}
+
 #[test]
 fn test_reserialize_complex() {
     let data = Struct {
@@ -104,6 +120,14 @@ fn test_reserialize_complex() {
         tup: (false, 786583289812096971589793284203998369),
     };
     test_reserialize(&data);
+}
+
+#[test]
+fn test_repeat_before_field_name_bug() {
+    test_reserialize(&BugTest1 {
+        points: [false, false],
+        unit: (),
+    });
 }
 
 #[test]
