@@ -113,7 +113,7 @@ impl SmolRead for ObjectValue {
                 while let Some(v) = a.read_value()? {
                     vec.push(Self::read(v)?);
                 }
-                Self::Tuple(vec)
+                Self::Array(vec)
             }
             ValueReading::Map(mut m) => {
                 let mut vec = match m.remaining() {
