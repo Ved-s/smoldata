@@ -921,6 +921,28 @@ impl TryFrom<Primitive> for () {
     }
 }
 
+impl crate::writer::InternalWritePrimitive for Primitive {
+    fn into_tag(self) -> Tag<'static> {
+        match self {
+            Primitive::Unit => Tag::Unit,
+            Primitive::Bool(b) => Tag::Bool(b),
+            Primitive::U8(v) => Tag::Integer(IntegerTag::U8(v)),
+            Primitive::I8(v) => Tag::Integer(IntegerTag::I8(v)),
+            Primitive::U16(v) => Tag::Integer(IntegerTag::U16(v)),
+            Primitive::I16(v) => Tag::Integer(IntegerTag::I16(v)),
+            Primitive::U32(v) => Tag::Integer(IntegerTag::U32(v)),
+            Primitive::I32(v) => Tag::Integer(IntegerTag::I32(v)),
+            Primitive::U64(v) => Tag::Integer(IntegerTag::U64(v)),
+            Primitive::I64(v) => Tag::Integer(IntegerTag::I64(v)),
+            Primitive::U128(v) => Tag::Integer(IntegerTag::U128(v)),
+            Primitive::I128(v) => Tag::Integer(IntegerTag::I128(v)),
+            Primitive::Char(c) => Tag::Char(c),
+            Primitive::F32(f) => Tag::F32(f),
+            Primitive::F64(f) => Tag::F64(f),
+        }
+    }
+}
+
 macro_rules! impl_primitive_try_from {
     ($($ty:ident $primty:ident),* $(,)?) => {
         $(

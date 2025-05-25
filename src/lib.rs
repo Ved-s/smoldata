@@ -11,6 +11,10 @@ mod tests;
 
 #[cfg(feature = "raw_value")]
 pub mod raw;
+
+#[cfg(feature = "object_value")]
+pub mod object;
+
 pub mod reader;
 pub mod str;
 pub mod writer;
@@ -27,6 +31,7 @@ use std::{
 
 #[cfg(feature = "raw_value")]
 use raw::RawValue;
+
 use reader::{ReadError, ReadResult, UnexpectedValueError, UnexpectedValueResultExt, ValueReader};
 use writer::ValueWriter;
 
@@ -198,7 +203,7 @@ impl SmolWrite for String {
 
 impl<T: SmolWrite> SmolWrite for Vec<T> {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
-        let mut seq = writer.write_seq(Some(self.len()))?;
+        let mut seq = writer.write_array(Some(self.len()))?;
         for i in self {
             i.write(seq.write_value())?;
         }
@@ -208,7 +213,7 @@ impl<T: SmolWrite> SmolWrite for Vec<T> {
 
 impl<T: SmolWrite> SmolWrite for [T] {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
-        let mut seq = writer.write_seq(Some(self.len()))?;
+        let mut seq = writer.write_array(Some(self.len()))?;
         for i in self {
             i.write(seq.write_value())?;
         }
@@ -218,7 +223,7 @@ impl<T: SmolWrite> SmolWrite for [T] {
 
 impl<T: SmolWrite, const N: usize> SmolWrite for [T; N] {
     fn write(&self, writer: ValueWriter) -> io::Result<()> {
-        let mut seq = writer.write_seq(Some(self.len()))?;
+        let mut seq = writer.write_array(Some(self.len()))?;
         for i in self {
             i.write(seq.write_value())?;
         }

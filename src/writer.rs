@@ -544,7 +544,7 @@ pub struct ValueWriter<'rf, 'wr> {
 #[allow(unused)]
 impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     #[track_caller]
-    pub fn write_primitive<P: Primitive>(mut self, pri: P) -> io::Result<()> {
+    pub fn write_primitive<P: WritePrimitive>(mut self, pri: P) -> io::Result<()> {
         let mut writer = self.writer.get();
         writer.write_tag(pri.into_tag())?;
         self.writer.finish();
@@ -752,7 +752,7 @@ impl<'rf, 'wr> ValueWriter<'rf, 'wr> {
     }
 
     #[track_caller]
-    pub fn write_seq(mut self, len: Option<usize>) -> io::Result<ArrayWriter<'rf, 'wr>> {
+    pub fn write_array(mut self, len: Option<usize>) -> io::Result<ArrayWriter<'rf, 'wr>> {
         let mut writer = self.writer.get();
         writer.write_tag(Tag::Array { len })?;
 
@@ -960,15 +960,15 @@ impl<'rf, 'wr> MapPairWtiter<'rf, 'wr> {
 }
 
 #[allow(private_bounds)]
-pub trait Primitive: InternalPrimitive {}
+pub trait WritePrimitive: InternalWritePrimitive {}
 
-impl<T: InternalPrimitive> Primitive for T {}
+impl<T: InternalWritePrimitive> WritePrimitive for T {}
 
-pub(crate) trait InternalPrimitive {
+pub(crate) trait InternalWritePrimitive {
     fn into_tag(self) -> Tag<'static>;
 }
 
-impl InternalPrimitive for () {
+impl InternalWritePrimitive for () {
     fn into_tag(self) -> Tag<'static> {
         Tag::Unit
     }
@@ -976,7 +976,7 @@ impl InternalPrimitive for () {
 
 macro_rules! impl_primitive {
     ($($member:ident $ty:ty),* $(,)?) => {
-        $(impl InternalPrimitive for $ty {
+        $(impl InternalWritePrimitive for $ty {
             fn into_tag(self) -> Tag<'static> {
                 Tag::$member(self)
             }
@@ -986,7 +986,7 @@ macro_rules! impl_primitive {
 
 macro_rules! impl_primitive_int {
     ($($member:ident $ty:ty),* $(,)?) => {
-        $(impl InternalPrimitive for $ty {
+        $(impl InternalWritePrimitive for $ty {
             fn into_tag(self) -> Tag<'static> {
                 Tag::Integer(IntegerTag::$member(self.into()))
             }

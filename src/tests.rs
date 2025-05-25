@@ -45,7 +45,7 @@ struct NoLenSerialize<V>(Vec<V>);
 
 impl<V: SmolWrite> SmolWrite for NoLenSerialize<V> {
     fn write(&self, writer: crate::writer::ValueWriter) -> io::Result<()> {
-        let mut writer = writer.write_seq(None)?;
+        let mut writer = writer.write_array(None)?;
 
         for i in &self.0 {
             i.write(writer.write_value())?;

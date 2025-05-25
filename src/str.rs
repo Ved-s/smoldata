@@ -61,6 +61,16 @@ pub enum SdString {
     Owned(String),
 }
 
+impl SdString {
+    pub fn as_ref_arc(&self) -> RefArcStr<'_> {
+        match self {
+            SdString::Empty => RefArcStr::Str(""),
+            SdString::Arc(a) => RefArcStr::Arc(a.clone()),
+            SdString::Owned(s) => RefArcStr::Str(s),
+        }
+    }
+}
+
 impl From<Arc<str>> for SdString {
     fn from(value: Arc<str>) -> Self {
         Self::Arc(value)
