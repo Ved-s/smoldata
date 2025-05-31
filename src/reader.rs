@@ -1315,7 +1315,7 @@ pub enum ValueType {
     Map,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ValueTypeRequirement {
     Primitive(Option<PrimitiveType>),
     String,
@@ -1326,6 +1326,7 @@ pub enum ValueTypeRequirement {
     Tuple,
     Array,
     Map,
+    Custom(RefArcStr<'static>)
 }
 
 impl Debug for ValueTypeRequirement {
@@ -1344,6 +1345,7 @@ impl Debug for ValueTypeRequirement {
             Self::Tuple => write!(f, "Tuple"),
             Self::Array => write!(f, "Array"),
             Self::Map => write!(f, "Map"),
+            Self::Custom(c) => f.write_str(c),
         }
     }
 }
