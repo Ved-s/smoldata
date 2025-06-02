@@ -1,6 +1,6 @@
 use proc_macro2::{Ident, Literal, Span, TokenStream};
 use quote::{ToTokens, quote};
-use syn::{DeriveInput, Generics, Type, spanned::Spanned};
+use syn::{DeriveInput, Generics, Type, parse::Parse, spanned::Spanned};
 
 #[proc_macro_derive(SmolWrite, attributes(sd))]
 pub fn derive_write(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
@@ -76,20 +76,28 @@ fn derive_from_tokens(
                             add_error(e);
                         }
 
+                        if let Err(e) = attrs.verify_attributes() {
+                            add_error(e);
+                        }
+
                         Some((f.ident?, f.ty, attrs))
                     })
                     .map(|(ident, ty, attrs)| {
-                        let data_name = attrs.rename.unwrap_or_else(|| {
+                        let optimize_option = attrs.do_optimize_option(&ty);
+
+                        let data_name = attrs.rename.map(|a| a.attr).unwrap_or_else(|| {
                             StringLitOrPath::String(syn::LitStr::new(
                                 &ident_nonraw_string(&ident),
                                 Span::call_site(),
                             ))
                         });
+
                         NamedTypeField {
                             data_name,
                             name_str: ident_nonraw_string(&ident),
                             name: ident,
                             ty,
+                            optimize_option,
                         }
                     })
                     .collect(),
@@ -149,21 +157,28 @@ fn derive_from_tokens(
                                             add_error(e);
                                         }
 
+                                        if let Err(e) = attrs.verify_attributes() {
+                                            add_error(e);
+                                        }
+
                                         Some((f.ident?, f.ty, attrs))
                                     })
                                     .map(|(ident, ty, attrs)| {
-                                        let data_name = attrs.rename.unwrap_or_else(|| {
-                                            StringLitOrPath::String(syn::LitStr::new(
-                                                &ident_nonraw_string(&ident),
-                                                Span::call_site(),
-                                            ))
-                                        });
+                                        let optimize_option = attrs.do_optimize_option(&ty);
+                                        let data_name =
+                                            attrs.rename.map(|a| a.attr).unwrap_or_else(|| {
+                                                StringLitOrPath::String(syn::LitStr::new(
+                                                    &ident_nonraw_string(&ident),
+                                                    Span::call_site(),
+                                                ))
+                                            });
 
                                         NamedTypeField {
                                             data_name,
                                             name_str: ident_nonraw_string(&ident),
                                             name: ident,
                                             ty,
+                                            optimize_option,
                                         }
                                     })
                                     .collect(),
@@ -175,7 +190,7 @@ fn derive_from_tokens(
                             add_error(e);
                         }
 
-                        let data_name = attrs.rename.unwrap_or_else(|| {
+                        let data_name = attrs.rename.map(|a| a.attr).unwrap_or_else(|| {
                             StringLitOrPath::String(syn::LitStr::new(
                                 &ident_nonraw_string(&v.ident),
                                 Span::call_site(),
@@ -202,25 +217,24 @@ fn derive_from_tokens(
 }
 
 fn derive_from_parsed(input: &MacroInput) -> TokenStream {
-
     let codegen_data = CodegenData {
-        base_crate: input.type_attrs.smoldata.clone().unwrap_or_else(|| {
-
-            // #base_crate
-            syn::Path {
-                leading_colon: Some(syn::token::PathSep {
-                    spans: [
-                        Span::call_site(), Span::call_site()
-                    ]
-                }),
-                segments: syn::punctuated::Punctuated::from_iter([
-                    syn::PathSegment {
+        base_crate: input
+            .type_attrs
+            .smoldata
+            .as_ref()
+            .map(|a| a.attr.clone())
+            .unwrap_or_else(|| {
+                // #base_crate
+                syn::Path {
+                    leading_colon: Some(syn::token::PathSep {
+                        spans: [Span::call_site(), Span::call_site()],
+                    }),
+                    segments: syn::punctuated::Punctuated::from_iter([syn::PathSegment {
                         arguments: syn::PathArguments::None,
-                        ident: Ident::new("smoldata", Span::call_site())
-                    }
-                ]),
-            }
-        })
+                        ident: Ident::new("smoldata", Span::call_site()),
+                    }]),
+                }
+            }),
     };
 
     let (impl_gen, type_gen, where_gen) = input.generics.split_for_impl();
@@ -264,7 +278,12 @@ fn derive_from_parsed(input: &MacroInput) -> TokenStream {
     }
 }
 
-fn impl_derive_method(trty: TraitType, inty: &InputType, reader_writer: &Ident, data: &CodegenData) -> TokenStream {
+fn impl_derive_method(
+    trty: TraitType,
+    inty: &InputType,
+    reader_writer: &Ident,
+    data: &CodegenData,
+) -> TokenStream {
     match (trty, inty) {
         (TraitType::Read, InputType::Struct(fields)) => {
             impl_derive_struct_read_method(fields, reader_writer, data)
@@ -296,8 +315,16 @@ fn gen_struct_write(
         let ty = &field.ty;
         let accessor = field_accessor(field);
 
-        quote! {
-            <#ty as #base_crate::SmolWrite>::write(#accessor, struc.write_field(#data_name)?)?;
+        if field.optimize_option {
+            quote! {
+                if let Some(f) = <#ty as #base_crate::OptionalFieldOptimization>::get(#accessor) {
+                    <<#ty as #base_crate::OptionalFieldOptimization>::Inner as #base_crate::SmolWrite>::write(f, struc.write_field(#data_name)?)?;
+                }
+            }
+        } else {
+            quote! {
+                <#ty as #base_crate::SmolWrite>::write(#accessor, struc.write_field(#data_name)?)?;
+            }
         }
     });
 
@@ -312,7 +339,11 @@ fn gen_struct_write(
     }
 }
 
-fn impl_derive_struct_write_method(fields: &[NamedTypeField], writer: &Ident, data: &CodegenData) -> TokenStream {
+fn impl_derive_struct_write_method(
+    fields: &[NamedTypeField],
+    writer: &Ident,
+    data: &CodegenData,
+) -> TokenStream {
     let body = gen_struct_write(fields, writer, data, None, &|field| {
         let name = &field.name;
         quote! { &self.#name }
@@ -323,9 +354,13 @@ fn impl_derive_struct_write_method(fields: &[NamedTypeField], writer: &Ident, da
     }
 }
 
-fn impl_derive_enum_write_method(variants: &[EnumVariant], writer: &Ident, data: &CodegenData) -> TokenStream {
+fn impl_derive_enum_write_method(
+    variants: &[EnumVariant],
+    writer: &Ident,
+    data: &CodegenData,
+) -> TokenStream {
     let base_crate = &data.base_crate;
-    
+
     let member_impls = variants.iter().map(|v| {
         let EnumVariant { name, data_name, ty, .. } = v;
 
@@ -416,6 +451,7 @@ fn gen_struct_read(
 
     let tmp_defs = fields.iter().map(|(field, tmp_ident)| {
         let ty = &field.ty;
+
         quote! {
             let mut #tmp_ident = None::<#ty>;
         }
@@ -425,6 +461,23 @@ fn gen_struct_read(
         let data_name = &field.data_name;
         let name_str = &field.name_str;
         let ty = &field.ty;
+
+        let reading_preoptopt = quote! {
+            #tmp_ident = Some(<#ty as #base_crate::SmolRead>::read(field.1)?);
+        };
+
+        let reading = if field.optimize_option {
+            quote! {
+                if format_version >= <#ty as #base_crate::OptionalFieldOptimization>::MIN_FORMAT_VERSION {
+                    #tmp_ident = Some(<#ty as #base_crate::OptionalFieldOptimization>::make_some(<<#ty as #base_crate::OptionalFieldOptimization>::Inner as #base_crate::SmolRead>::read(field.1)?));
+                } else {
+                    #reading_preoptopt
+                }
+            }
+        } else {
+            reading_preoptopt
+        };
+
         quote! {
             #data_name => {
                 if #tmp_ident.is_some() {
@@ -434,18 +487,39 @@ fn gen_struct_read(
                     }
                     .into());
                 }
-                #tmp_ident = Some(<#ty as #base_crate::SmolRead>::read(field.1)?);
+                #reading
             }
         }
     });
 
     let unwraps = fields.iter().map(|(field, tmp_ident)| {
         let name_str = &field.name_str;
-        quote! {
-            let #tmp_ident = #tmp_ident.ok_or_else(|| #base_crate::reader::ReadError::MissingStructField {
+        let ty = &field.ty;
+
+        let missing_field_err = quote! {
+            #base_crate::reader::ReadError::MissingStructField {
                 name: #name_str,
                 type_name: ::std::any::type_name::<Self>(),
-            })?;
+            }
+        };
+
+        if field.optimize_option {
+            quote! {
+                let #tmp_ident = match (#tmp_ident, (format_version >= <#ty as #base_crate::OptionalFieldOptimization>::MIN_FORMAT_VERSION)) {
+                    (Some(v), _) => v,
+                    (None, true) => {
+                        <#ty as #base_crate::OptionalFieldOptimization>::make_none()
+                    }
+                    (None, false) => {
+                        return Err(#missing_field_err.into())
+                    }
+                };
+            }
+        }
+        else {
+            quote! {
+                let #tmp_ident = #tmp_ident.ok_or_else(|| #missing_field_err)?;
+            }
         }
     });
 
@@ -468,9 +542,12 @@ fn gen_struct_read(
     let result = struct_builder(&mut struct_fields);
 
     quote! {
+
         let mut struc = #reader
             .#reader_call
             .map_err(#base_crate::reader::ReadError::from)?;
+
+        let format_version = struc.format_version();
 
         #(#tmp_defs)*
 
@@ -494,7 +571,11 @@ fn gen_struct_read(
     }
 }
 
-fn impl_derive_struct_read_method(fields: &[NamedTypeField], reader: &Ident, data: &CodegenData) -> TokenStream {
+fn impl_derive_struct_read_method(
+    fields: &[NamedTypeField],
+    reader: &Ident,
+    data: &CodegenData,
+) -> TokenStream {
     gen_struct_read(
         fields,
         reader,
@@ -504,7 +585,11 @@ fn impl_derive_struct_read_method(fields: &[NamedTypeField], reader: &Ident, dat
     )
 }
 
-fn impl_derive_enum_read_method(variants: &[EnumVariant], reader: &Ident, data: &CodegenData) -> TokenStream {
+fn impl_derive_enum_read_method(
+    variants: &[EnumVariant],
+    reader: &Ident,
+    data: &CodegenData,
+) -> TokenStream {
     let base_crate = &data.base_crate;
     let variants_impl = variants.iter().map(|var| {
         let name = &var.name;
@@ -651,7 +736,7 @@ struct MacroInput {
 }
 
 struct CodegenData {
-    base_crate: syn::Path
+    base_crate: syn::Path,
 }
 
 #[derive(Clone, Copy)]
@@ -708,6 +793,8 @@ struct NamedTypeField {
     name_str: String,
     data_name: StringLitOrPath,
     ty: Type,
+
+    optimize_option: bool,
 }
 
 struct UnnamedTypeField {
@@ -758,7 +845,31 @@ impl syn::parse::Parse for StringLitOrPath {
     }
 }
 
+trait ParseAttribute: Sized {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self>;
+}
+
+impl<T: Parse> ParseAttribute for T {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        <syn::Token![=] as syn::parse::Parse>::parse(input)?;
+        <Self as Parse>::parse(input)
+    }
+}
+
+impl ParseAttribute for Empty {
+    fn parse(_input: syn::parse::ParseStream) -> syn::Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Empty;
+
 macro_rules! define_attributes {
+    (@parse $reader:ident ()) => { () };
+    (@parse $reader:ident $attrty:ty) => {{
+
+    }};
     {
         #[target = $target:literal]
         $(#[$meta:meta])*
@@ -772,7 +883,7 @@ macro_rules! define_attributes {
         #[derive(Default)]
         struct $name {
             $(
-                $attrname: Option<$attrty>,
+                $attrname: Option<Attribute<$attrty>>,
             )*
         }
 
@@ -794,8 +905,10 @@ macro_rules! define_attributes {
                 match name {
                     $(
                         stringify!($attrname) => {
-                            <syn::Token![=] as syn::parse::Parse>::parse(reader)?;
-                            self.$attrname = Some(syn::parse::Parse::parse(reader)?);
+                            self.$attrname = Some(Attribute {
+                                span: name_span,
+                                attr: <$attrty as ParseAttribute>::parse(reader)?
+                            });
                         }
                     )*
                     _ => return Err(syn::Error::new(name_span, format!("invalid attribute for {}: {}", $target, name))),
@@ -815,6 +928,12 @@ macro_rules! define_attributes {
     };
 }
 
+#[derive(Clone)]
+struct Attribute<T> {
+    span: Span,
+    attr: T,
+}
+
 define_attributes! {
     #[target = "enum variant"]
     struct VariantAttributes {
@@ -826,6 +945,8 @@ define_attributes! {
     #[target = "struct field"]
     struct StructFieldAttributes {
         rename: StringLitOrPath,
+        do_opt_option: Empty,
+        dont_opt_option: Empty,
     }
 }
 
@@ -833,6 +954,75 @@ define_attributes! {
     #[target = "type"]
     struct InputTypeAttributes {
         smoldata: syn::Path
+    }
+}
+
+impl StructFieldAttributes {
+    fn do_optimize_option(&self, ty: &syn::Type) -> bool {
+        if self.dont_opt_option.is_some() {
+            return false;
+        }
+
+        if self.do_opt_option.is_some() {
+            return true;
+        }
+
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+
+        if path.qself.is_some() {
+            return false;
+        }
+
+        let mut matching_std_option = false;
+        for (i, v) in path.path.segments.iter().enumerate() {
+            let name = v.ident.to_string();
+            if i == 0 {
+                if path.path.leading_colon.is_none()
+                    && name == "Option"
+                    && path.path.segments.len() == 1
+                {
+                    return true;
+                } else if (name == "std" || name == "core") && path.path.segments.len() == 3 {
+                    matching_std_option = true;
+                    continue;
+                } else {
+                    return false;
+                }
+            } else if i == 1 && matching_std_option && name == "option" {
+                continue;
+            } else if i == 2 && matching_std_option && name == "Option" {
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        false
+    }
+
+    fn verify_attributes(&self) -> syn::Result<()> {
+        if let Some((d, dn)) = self
+            .do_opt_option
+            .as_ref()
+            .zip(self.dont_opt_option.as_ref())
+        {
+            let mut err1 = syn::Error::new(
+                d.span,
+                "Both `do_opt_option` and `dont_opt_option` are specified",
+            );
+            let err2 = syn::Error::new(
+                dn.span,
+                "Both `do_opt_option` and `dont_opt_option` are specified",
+            );
+
+            err1.combine(err2);
+
+            return Err(err1);
+        }
+
+        Ok(())
     }
 }
 

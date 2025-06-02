@@ -1,6 +1,9 @@
 use std::{borrow::Cow, collections::HashMap, fmt, io, ops::Deref};
 
-use crate::{reader::{ReadError, UnexpectedValueResultExt}, SmolRead, SmolReadWrite, SmolWrite, FORMAT_VERSION};
+use crate::{
+    reader::{ReadError, UnexpectedValueResultExt},
+    SmolRead, SmolReadWrite, SmolWrite, FORMAT_VERSION,
+};
 
 #[cfg(feature = "raw_value")]
 use crate::raw::RawValue;
@@ -78,7 +81,11 @@ impl SmolWrite for Bytes<'_> {
 
 impl SmolRead for Bytes<'_> {
     fn read(reader: crate::reader::ValueReader) -> crate::reader::ReadResult<Self> {
-        let bytes = reader.read()?.take_bytes().with_type_name_of::<Self>().map_err(ReadError::from)?;
+        let bytes = reader
+            .read()?
+            .take_bytes()
+            .with_type_name_of::<Self>()
+            .map_err(ReadError::from)?;
         Ok(Self(Cow::Owned(bytes.read()?)))
     }
 }
@@ -161,7 +168,13 @@ fn test_repeats() {
     do_test_repeats(&data, false);
 
     let d: [u8; 3] = [0x80, 0x99, 0xff];
-    let data = [Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d)), Bytes(Cow::Borrowed(&d))];
+    let data = [
+        Bytes(Cow::Borrowed(&d)),
+        Bytes(Cow::Borrowed(&d)),
+        Bytes(Cow::Borrowed(&d)),
+        Bytes(Cow::Borrowed(&d)),
+        Bytes(Cow::Borrowed(&d)),
+    ];
 
     do_test_repeats(&data, false);
 }
@@ -184,9 +197,9 @@ fn do_test_repeats<T: Eq + std::fmt::Debug + SmolReadWrite>(data: &[T], test_sma
         vec.len()
     );
     println!();
-    
+
     hexdump(&vec);
-    
+
     println!();
 
     if test_smaller {
@@ -324,6 +337,44 @@ fn test_reserialize<T: SmolReadWrite + Eq + fmt::Debug>(data: &T) {
     if &re != data {
         panic!("DATA DOESN'T MATCH!");
     }
+}
+
+#[test]
+fn test_option_optimization() {
+    #[derive(Debug, PartialEq, Eq, SmolRead)]
+    #[sd(smoldata = crate)]
+    struct Data {
+        op: Option<Option<i32>>,
+    }
+
+    fn test_data(old: &[u8], new: &[u8], result: Data) {
+        assert_eq!(crate::read_from_bytes::<Data>(old).unwrap(), result);
+        assert_eq!(crate::read_from_bytes::<Data>(new).unwrap(), result);
+    }
+
+    test_data(
+        b"sd\x00\x2a\x01\x40\x02op\x1e\x1e\x10\x0f",
+        b"sd\x01\x2a\x01\x40\x02op\x1e\x10\x0f",
+        Data {
+            op: Some(Some(15i32)),
+        },
+    );
+
+    test_data(
+        b"sd\x00\x2a\x01\x40\x02op\x1e\x1d",
+        b"sd\x01\x2a\x01\x40\x02op\x1d",
+        Data {
+            op: Some(None),
+        },
+    );
+
+    test_data(
+        b"sd\x00\x2a\x01\x40\x02op\x1d",
+        b"sd\x01\x2a\x00",
+        Data {
+            op: None,
+        },
+    );
 }
 
 fn hexdump(bytes: &[u8]) {

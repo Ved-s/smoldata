@@ -538,6 +538,10 @@ impl<'rd> ReaderLevel<'_, 'rd> {
             level: Some(level),
         }
     }
+    
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version
+    }
 }
 
 pub(crate) struct ReaderRef<'rf, 'rd> {
@@ -1038,6 +1042,10 @@ impl StringReader<'_, '_> {
 
         Ok(str)
     }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
+    }
 }
 
 pub struct BytesReader<'rf, 'rd> {
@@ -1073,6 +1081,10 @@ impl BytesReader<'_, '_> {
 
         Ok(vec)
     }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
+    }
 }
 
 pub struct TupleReader<'rf, 'rd> {
@@ -1100,6 +1112,10 @@ impl<'rd> TupleReader<'_, 'rd> {
 
     pub fn remaining(&self) -> usize {
         self.remaining
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
     }
 }
 
@@ -1133,6 +1149,10 @@ impl<'rd> StructReader<'_, 'rd> {
 
     pub fn remaining(&self) -> usize {
         self.remaining
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
     }
 }
 
@@ -1299,6 +1319,10 @@ impl<'rf, 'rd> EnumReading<'rf, 'rd> {
             StructTag::Tuple { .. } => StructType::Tuple,
             StructTag::Struct { .. } => StructType::Struct,
         }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
     }
 }
 
@@ -1557,6 +1581,10 @@ impl<'rd> ArrayReader<'_, 'rd> {
     pub fn remaining(&self) -> Option<usize> {
         self.remaining
     }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
+    }
 }
 
 pub struct MapReader<'rf, 'rd> {
@@ -1598,6 +1626,10 @@ impl<'rd> MapReader<'_, 'rd> {
     pub fn remaining(&self) -> Option<usize> {
         self.remaining
     }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
+    }
 }
 
 pub struct MapPairReader<'rf, 'rd> {
@@ -1627,6 +1659,10 @@ impl<'rf, 'rd> MapPairReader<'rf, 'rd> {
         ValueReader {
             reader: self.reader,
         }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
     }
 }
 
@@ -1740,5 +1776,9 @@ impl<'rf, 'rd> ValueReader<'rf, 'rd> {
                 })
             }
         })
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.reader.format_version()
     }
 }

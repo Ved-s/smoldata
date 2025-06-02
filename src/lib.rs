@@ -38,7 +38,9 @@ use writer::ValueWriter;
 pub use smoldata_derive::{SmolRead, SmolReadWrite, SmolWrite};
 
 pub const MAGIC_HEADER: &[u8] = b"sd";
-pub const FORMAT_VERSION: u32 = 0;
+pub const FORMAT_VERSION: u32 = 1;
+
+pub const FORMAT_OPTIONAL_FIELD_OPTIMIZATION: u32 = 1;
 
 /// Write data into a writer.<br>
 /// Writer preferred to be buffered, serialization does many small writes
@@ -682,4 +684,36 @@ impl<T: SmolRead + Sized> SmolRead for Option<T> {
             Some(r) => Some(<T as SmolRead>::read(r)?),
         })
     }
+}
+
+pub trait OptionalFieldOptimization: Sized {
+    type Inner: Sized;
+    const MIN_FORMAT_VERSION: u32 = FORMAT_OPTIONAL_FIELD_OPTIMIZATION;
+
+    fn make_none() -> Self;
+    fn make_some(inner: Self::Inner) -> Self;
+
+    fn get(&self) -> Option<&Self::Inner>;
+}
+
+impl<T> OptionalFieldOptimization for Option<T> {
+    type Inner = T;
+
+    fn make_none() -> Self {
+        None
+    }
+
+    fn make_some(inner: Self::Inner) -> Self {
+        Some(inner)
+    }
+
+    fn get(&self) -> Option<&Self::Inner> {
+        self.as_ref()
+    }
+}
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+struct Test {
+    op: Option<i32>,
 }
