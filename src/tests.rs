@@ -90,20 +90,11 @@ impl SmolRead for Bytes<'_> {
     }
 }
 
-#[derive(SmolRead, Debug, Clone, PartialEq, Eq)]
+#[derive(SmolReadWrite, Debug, Clone, PartialEq, Eq)]
 #[sd(smoldata = crate)]
 struct BugTest1 {
     points: [bool; 2],
     unit: (),
-}
-
-impl crate::SmolWrite for BugTest1 {
-    fn write(&self, writer: crate::writer::ValueWriter) -> ::std::io::Result<()> {
-        let mut struc = writer.write_struct(2usize)?;
-        <[bool; 2] as crate::SmolWrite>::write(&self.points, struc.write_field("points")?)?;
-        <() as crate::SmolWrite>::write(&self.unit, struc.write_field("unit")?)?;
-        Ok(())
-    }
 }
 
 #[test]
@@ -375,6 +366,20 @@ fn test_option_optimization() {
             op: None,
         },
     );
+
+    {
+        #[derive(SmolReadWrite)]
+        #[sd(smoldata = crate)]
+        struct Option<T>(T);
+
+        #[derive(SmolReadWrite)]
+        #[sd(smoldata = crate)]
+        struct Data {
+
+            #[sd(dont_opt_option)]
+            op: Option<i32>,
+        }
+    }
 }
 
 fn hexdump(bytes: &[u8]) {
@@ -415,5 +420,39 @@ fn hexdump(bytes: &[u8]) {
         }
 
         println!();
+    }
+}
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+struct TestUnitStruct;
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+struct TestNewtypeStruct<T>(T);
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+struct TestTupleStruct<T, U>(T, TestNewtypeStruct<T>, U);
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+struct TestFieldStruct<T, U, V> {
+    a: TestUnitStruct,
+    b: TestNewtypeStruct<T>,
+    c: TestTupleStruct<U, V>,
+}
+
+#[derive(SmolReadWrite)]
+#[sd(smoldata = crate)]
+enum TestEnum<T> {
+    Unit,
+    Newtype(T),
+    Tuple(T, TestNewtypeStruct<T>),
+    Fields {
+        a: T,
+        b: TestUnitStruct,
+        c: TestNewtypeStruct<T>,
+        d: TestTupleStruct<T, T>,
     }
 }

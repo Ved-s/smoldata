@@ -686,6 +686,9 @@ impl<T: SmolRead + Sized> SmolRead for Option<T> {
     }
 }
 
+#[diagnostic::on_unimplemented(
+    note = "If you see this on a struct field and the type looks similar to a builtin type, but is actually not (like `Option`), add a `#[sd(dont_opt_option)]` attribute"
+)]
 pub trait OptionalFieldOptimization: Sized {
     type Inner: Sized;
     const MIN_FORMAT_VERSION: u32 = FORMAT_OPTIONAL_FIELD_OPTIMIZATION;
@@ -710,10 +713,4 @@ impl<T> OptionalFieldOptimization for Option<T> {
     fn get(&self) -> Option<&Self::Inner> {
         self.as_ref()
     }
-}
-
-#[derive(SmolReadWrite)]
-#[sd(smoldata = crate)]
-struct Test {
-    op: Option<i32>,
 }
