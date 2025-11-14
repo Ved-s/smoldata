@@ -76,10 +76,10 @@ impl SmolRead for RawValue {
         let mut vec = vec![];
         let mut main_writer = crate::writer::Writer::new_headerless(&mut vec);
         let writer = main_writer.get_ref();
-
         copy_object(reader, writer)?;
 
         main_reader.reader.finish();
+        main_writer.finish().map_err(|e| Box::new(e.into()))?;
 
         Ok(RawValue(vec.into_boxed_slice()))
     }

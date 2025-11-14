@@ -90,7 +90,7 @@ impl<'a> Writer<'a> {
     }
 
     #[allow(unused)]
-    pub(crate) fn get_ref(&mut self) -> WriterRef<'a, '_> {
+    pub(crate) fn get_ref(&mut self) -> WriterRef<'_, 'a> {
         WriterRef { writer: self }
     }
 
